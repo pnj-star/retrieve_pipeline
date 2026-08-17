@@ -1,0 +1,89 @@
+---
+name: rag_skill
+description: 基于 common_core 组件实现的可复用 RAG 能力，提供租户隔离、混合检索、RRF 融合、交叉编码器精排、生成护栏与响应缓存。当 agent 或其他服务需要从知识库检索并生成可追溯答案时，通过 rag_answer / rag_retrieve 调用。
+---
+
+# rag_skill
+
+`rag_skill` 是通用 RAG 能力层，不包含 LangGraph 编排，也不包含业务话术。它接收 `query + tenant_id + kb_id + request_id`，内部完成缓存、混合检索、融合、精排、阈值判断、生成和护栏，最后返回稳定契约。
+
+## 处理流程
+
+```text
+query + tenant_id + kb_id + request_id
+→ 响应缓存检查
+   ├─ 命中 → status=answered_cache，直接返回
+   └─ 未命中 → 继续
+→ 稀疏检索 + 稠密检索（各取 top-k）
+   ├─ 两者都为空 → status=no_context，结束
+   └─ 任一有结果 → 下一步
+→ RRF 融合，得到候选文档
+→ 交叉编码器精排，得到统一 relevance 分数
+→ 与 RETRIEVAL_MIN_RELEVANCE 比较
+   ├─ 没有文档过阈值 → status=no_context，结束
+   └─ 有文档过阈值 → 拼上下文 → 生成 → 护栏
+→ status=answered + message + docs + answer
+```
+
+## 文件布局
+
+- `src/rag_skill/builder.py`: 从环境变量构建 runtime、provider、cache、reranker、guard 等实例。
+- `src/rag_skill/pipeline.py`: `RagPipeline` 统一执行检索、重排、生成、缓存和指标。
+- `src/rag_skill/mcp.py`: MCP 工具入口 `rag_answer` / `rag_retrieve`。
+- `src/rag_skill/results.py`: `RagResult` / `RagStatus` 返回契约。
+- `src/rag_skill/stages/`: 缓存、上下文组装、生成、护栏、重排、人工交接等阶段。
+- `tests/`: 使用 fake provider 的契约测试，不依赖外部服务。
+
+## MCP 工具
+
+`rag_answer` 必传参数：`query`、`tenant_id`、`kb_id`、`request_id`。
+
+可选参数：`auth_token`、`session_id`、`user_id`、`system_prompt`、`top_k`、`empty_answer`、`filter_expr`、`min_relevance`、`enable_guard`、`prompt_template`、`context_max_chars`、`temperature`、`max_tokens`。
+
+注意：
+
+- `prompt_template` 必须包含 `{context}`，可以使用 `{query}`；不传时使用默认模板。
+- `system_prompt` 作为额外指令追加到生成提示，不替换默认模板。
+- `context_max_chars` 控制拼入上下文的字符上限，默认 `8000`。
+- 启用 JWT 时 `auth_token` 中的 `tenant_id` / `kb_id` claims 必须与调用参数一致。
+
+返回值契约（`rag_answer`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `answered` / `answered_cache` / `no_context` / `guard_blocked` / `error` |
+| `message` | 状态说明 |
+| `docs` | 精排后的文档；`no_context` / `guard_blocked` 时返回候选文档 |
+| `answer` | 生成或缓存的回答 |
+
+`rag_retrieve` 只做检索，返回 `status`（`retrieved` / `no_context`）、`count`、`docs`。
+
+## 配置
+
+常用环境变量（前缀与 `common_core` 一致）：
+
+- `MILVUS_TEXT_COLLECTION` / `MILVUS_IMAGE_COLLECTION`: 文本 / 图片集合。
+- `MILVUS_OUTPUT_FIELDS`: 检索返回的文本字段，逗号分隔。不配置时默认 `id,content,source,category,parent_content,parent_title,chunk_index,tenant_id,kb_id`；不同集合 schema 可通过该变量覆盖，避免查询报错。
+- `RETRIEVAL_TOP_K` / `RETRIEVAL_MIN_RELEVANCE` / `RETRIEVAL_RRF_TOP_K` / `RETRIEVAL_RRF_K`: 检索与精排阈值参数。
+- `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` / `REDIS_KEY_PREFIX`: 响应缓存。
+- `METRICS_ENABLED` / `METRICS_PREFIX` / `METRICS_PORT`: Prometheus 指标。缓存命中、写入、跳过、失败统一记录到 `<prefix>_cache_results_total`，labels 为 `result` / `tenant_id` / `kb_id`。
+- `AUTH_MODE` / `AUTH_JWT_SECRET`: 工具鉴权，默认 `jwt`。
+
+## 使用示例
+
+```python
+from common_core.context import AgentContext
+from rag_skill.builder import build_pipeline, build_runtime
+
+runtime = build_runtime()
+pipeline = build_pipeline(runtime)
+ctx = AgentContext(tenant_id="merchant", kb_id="merchant_kb", request_id="req-1")
+result = await pipeline.answer("当前支持的售后流程是什么？", context=ctx)
+print(result.status, result.answer)
+```
+
+## 边界
+
+- 不包含 LangGraph：编排和业务节点由 `instances/*` 或外层 agent 完成。
+- 不包含业务词表、话术、知识摄取策略：这些由实例配置注入。
+- `common_core` 提供通用 provider、鉴权、上下文、指标；`rag_skill` 只做 RAG 语义。
