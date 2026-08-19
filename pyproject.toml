@@ -4,13 +4,13 @@ version = "0.1.0"
 description = "Reusable RAG pipeline skill built on common_core providers."
 requires-python = ">=3.11"
 dependencies = [
-  "common-core[llm,vector,cache]>=0.1.0",
-  "tiktoken>=0.7",
+  "common-core[llm,vector,cache]~=0.1.0",
+  "tiktoken~=0.13",
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.2"]
-test = ["pytest>=8.0"]
+mcp = ["mcp>=1.2,<2"]
+test = ["pytest>=8.0,<9"]
 
 [project.scripts]
 rag-skill-mcp = "rag_skill.mcp:main"

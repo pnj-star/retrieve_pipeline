@@ -87,6 +87,14 @@ query + tenant_id + kb_id + request_id
 - `METRICS_ENABLED` / `METRICS_PREFIX` / `METRICS_PORT`: Prometheus 指标。缓存命中、写入、跳过、失败统一记录到 `<prefix>_cache_results_total`，labels 为 `result` / `tenant_id` / `kb_id`。
 - `AUTH_MODE` / `AUTH_JWT_SECRET`: 工具鉴权，默认 `jwt`。
 
+一套可运行的占位符配置见仓库根目录的 `.env.example`（只含占位符，不含真实密钥）。
+
+默认开关与成本：
+
+- 守卫（生成护栏）：默认关闭。每次回答若开启护栏，都会在生成后再做一次 LLM 评审，不合格最多重试 2 次，延迟和 token 成本显著上升；多 agent 工具场景建议按需 `enable_guard=True` 或 `build_pipeline(guard_config=GuardConfig())` 显式开启。
+- 响应缓存：默认开启（Redis）。同 query + tenant/kb 命中直接返回，是省成本的关键；需要最新检索时可显式关闭或调低命中优先级。
+- 查询改写：默认 `off`。启用 `llm_rewrite` / `query_expansion` 会增加一次 LLM 调用，只影响检索文本，不改变最终回答面向用户问题的语义。
+
 ## 使用示例
 
 ```python

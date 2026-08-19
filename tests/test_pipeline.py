@@ -230,13 +230,21 @@ def test_build_pipeline_constructs_providers() -> None:
     assert pipeline.cache is not None
 
 
-def test_build_pipeline_defaults_include_full_status_stages() -> None:
+def test_build_pipeline_defaults_include_stages() -> None:
     pipeline = build_pipeline(runtime=build_runtime(env={}))
     assert isinstance(pipeline.response_cache, ResponseCache)
     assert isinstance(pipeline.reranker, Reranker)
-    assert isinstance(pipeline.guard_config, GuardConfig)
+    assert pipeline.guard_config is None  # guard 默认关闭，按需启用
     assert pipeline.min_relevance == 0.70
     assert pipeline.count_tokens is not None
+
+
+def test_build_pipeline_guard_can_be_enabled_explicitly() -> None:
+    pipeline = build_pipeline(
+        runtime=build_runtime(env={}),
+        guard_config=GuardConfig(),
+    )
+    assert isinstance(pipeline.guard_config, GuardConfig)
 
 
 def test_build_pipeline_can_skip_default_stages() -> None:

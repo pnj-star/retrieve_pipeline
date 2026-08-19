@@ -14,7 +14,7 @@ from common_core.config import RuntimeConfig, load_env_files
 from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 
-from .stages import GuardConfig, RedisHandoffStore, Reranker, ResponseCache
+from .stages import RedisHandoffStore, Reranker, ResponseCache
 from .stages.rerank import DEFAULT_RERANK_MODEL
 from .tokenization import build_token_counter
 
@@ -132,8 +132,11 @@ def build_pipeline(
 ) -> Any:
     """组装完整的 RagPipeline。
 
-    - include_defaults=True 时自动注入响应缓存、重排器与默认护栏配置；
+    - include_defaults=True 时自动注入响应缓存、重排器与 token 计数；
       测试场景可传 False 跳过这些阶段（置为 None）。
+    - guard 默认关闭（guard_config=None）：护栏每轮回答都要多做一次 LLM 评审并可重试，
+      对多 agent 工具场景延迟与成本偏高，故默认不注入；需要时传入
+      ``guard_config=GuardConfig()`` 或调用时传 ``enable_guard=True``。
     - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker、count_tokens 等 RagPipeline 参数）；
     - count_tokens 推荐使用 ``build_token_counter()``：tiktoken 可用时按真实 token 计数，
       不可用时回退为字符数。
@@ -153,7 +156,6 @@ def build_pipeline(
             "reranker",
             build_reranker(runtime, metrics=metrics),
         )
-        kwargs.setdefault("guard_config", GuardConfig())
         kwargs.setdefault("count_tokens", build_token_counter())
     return RagPipeline(
         runtime=runtime,
