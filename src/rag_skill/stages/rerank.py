@@ -18,7 +18,7 @@ DEFAULT_RETRIEVAL_WEIGHT = 0.4  # 融合分中检索原始分数的权重
 
 
 def judge_relevance(docs: Sequence[dict[str, Any]], min_relevance: float) -> bool:
-    """相关性门控：返回 True 表示本回答需要转人工交接。
+    """相关性门控：返回 True 表示没有文档达到相关性阈值（管线返回 no_context）。
 
     缺失 ``ce_score`` 按 0.0 处理，因此透传（未重排）的结果永远不会被
     误判为相关。

@@ -1,31 +1,25 @@
-"""各阶段（stages）单元测试：覆盖重排、上下文组装、生成、护栏、
-人工交接与响应缓存的契约行为，使用 fake LLM / 缓存 / 存储。"""
+"""各阶段（stages）单元测试：覆盖重排、上下文组装、生成、护栏与
+响应缓存的契约行为，使用 fake LLM / 缓存 / 存储。"""
 
 import asyncio
 
 from common_core.context import AgentContext
 from rag_skill.stages import (
-    ChainHandoffStore,
     GenerationConfig,
     GuardConfig,
-    RedisHandoffStore,
     Reranker,
     ResponseCache,
     build_context_text,
-    build_handoff_record,
     check_compound_numbers,
     clean_markdown,
     dedupe_docs,
-    default_template_selector,
     evaluate_guard,
     extract_images,
     generate_answer,
     guard_generation,
     judge_relevance,
-    persist_handoff,
     rank_docs,
 )
-from rag_skill.stages.handoff import HandoffRecord
 
 
 class FakeLLM:
@@ -124,34 +118,6 @@ class FakeCache:
     ) -> bool:
         key = self.key(scope, material, tenant_id=tenant_id, kb_id=kb_id)
         return self.store.pop(key, None) is not None
-
-
-class FakeStore:
-    def __init__(self, ok: bool = True) -> None:
-        self.ok = ok
-        self.saved: list[HandoffRecord] = []
-
-    def save(self, record: HandoffRecord) -> bool:
-        if not self.ok:
-            return False
-        self.saved.append(record)
-        return True
-
-    async def asave(self, record: HandoffRecord) -> bool:
-        return self.save(record)
-
-    def get(self, record_id: str) -> HandoffRecord | None:
-        for record in self.saved:
-            if record.id == record_id:
-                return record
-        return None
-
-    def delete(self, record_id: str) -> bool:
-        before = len(self.saved)
-        self.saved = [r for r in self.saved if r.id != record_id]
-        return len(self.saved) < before
-
-
 class FakeMetrics:
     def __init__(self) -> None:
         self.cache_events: list[tuple[str, str, str]] = []
@@ -488,48 +454,6 @@ def test_guard_generation_retries_until_pass() -> None:
     assert "too short" in seen_reasons[2]
     assert response == "answer 3"
 
-
-def test_build_handoff_record_truncates_candidates() -> None:
-    record = build_handoff_record(
-        "query text",
-        "retrieval_low_relevance",
-        docs=[{"content": "x" * 1000, "score": 0.2}] * 5,
-        images=[{"image_url": "u1"}],
-        doc_limit=3,
-        doc_chars=500,
-    )
-    assert record.id.startswith("handoff:")
-    assert len(record.candidate_docs) == 3
-    assert len(record.candidate_docs[0]["content"]) == 500
-    assert record.candidate_images == [{"url": "u1", "description": ""}]
-
-
-def test_default_template_selector_order() -> None:
-    select = default_template_selector(
-        {"empty": "E", "confidence": "C", "sql_miss": "S"}
-    )
-    assert select("q", False, "sql_miss") == "S"
-    assert select("q", False) == "E"
-    assert select("q", True) == "C"
-
-
-def test_chain_handoff_store_falls_back() -> None:
-    primary = FakeStore(ok=False)
-    fallback = FakeStore(ok=True)
-    chain = ChainHandoffStore([primary, fallback])
-    record = build_handoff_record("q", "reason")
-    assert chain.save(record)
-    assert not primary.saved
-    assert fallback.saved == [record]
-
-
-def test_persist_handoff_async_store() -> None:
-    store = FakeStore(ok=True)
-    record = build_handoff_record("q", "reason")
-    assert asyncio.run(persist_handoff(store, record))
-    assert store.saved == [record]
-
-
 def test_response_cache_tenant_isolation() -> None:
     cache = FakeCache()
     rc = ResponseCache(cache)
@@ -571,9 +495,3 @@ def test_response_cache_records_metrics() -> None:
         "hit",
     ]
 
-
-def test_redis_handoff_store_never_raises_without_redis() -> None:
-    store = RedisHandoffStore(cache=FakeCache())
-    record = build_handoff_record("q", "reason")
-    assert store.save(record) is False
-    assert store.get(record.id) is None

@@ -154,7 +154,7 @@ class RagPipeline:
       - llm: OpenAI 兼容 LLM
       - vector: Milvus 向量库（混合检索）
       - embedder: 本地 Embedding 模型
-      - cache: Redis 底层缓存（服务于响应缓存与人工交接存储）
+      - cache: Redis 底层缓存（服务于响应缓存）
       - reranker / response_cache / guard_config: 可选的重排、缓存与护栏阶段
     """
 
@@ -634,7 +634,7 @@ class RagPipeline:
             ranked = list(ranked or [])
 
         # 第六步：相关性阈值判断。低于阈值视为没有可用上下文，
-        # 但候选文档（ranked）会随结果返回，便于外层处理或人工交接。
+        # 但候选文档（ranked）会随结果返回，便于外层 agent 决定是否转人工。
         threshold = min_relevance if min_relevance is not None else self.min_relevance
         if self.reranker is not None and judge_relevance(ranked, threshold):
             return RagResult(

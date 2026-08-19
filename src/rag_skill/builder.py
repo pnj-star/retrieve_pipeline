@@ -2,7 +2,7 @@
 
 本模块是整个 rag_skill 的装配层：把 common_core 提供的通用能力
 （LLM、向量库、Embedding、Redis 缓存）与 rag_skill 自己的阶段
-（重排器、响应缓存、人工交接存储）组合成一个可直接运行的 RagPipeline。
+（重排器、响应缓存）组合成一个可直接运行的 RagPipeline。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from common_core.config import RuntimeConfig, load_env_files
 from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 
-from .stages import RedisHandoffStore, Reranker, ResponseCache
+from .stages import Reranker, ResponseCache
 from .stages.rerank import DEFAULT_RERANK_MODEL
 from .tokenization import build_token_counter
 
@@ -67,7 +67,7 @@ def build_cache(
     *,
     shared: bool = True,
 ) -> RedisCache:
-    """构建底层 Redis 缓存（响应缓存与人工交接存储共用）。"""
+    """构建底层 Redis 缓存（响应缓存共用）。"""
     runtime = runtime or build_runtime()
     return RedisCache(runtime.cache, shared=shared)
 
@@ -107,22 +107,6 @@ def build_response_cache(
         metrics=metrics,
         **overrides,
     )
-
-
-def build_handoff_store(
-    runtime: RuntimeConfig | None = None,
-    *,
-    cache: RedisCache | None = None,
-    **overrides: Any,
-) -> RedisHandoffStore:
-    """构建 Redis 人工交接存储（low-relevance 等场景下记录待人工处理）。"""
-    runtime = runtime or build_runtime()
-    return RedisHandoffStore(
-        cache or build_cache(runtime),
-        **overrides,
-    )
-
-
 def build_pipeline(
     runtime: RuntimeConfig | None = None,
     *,

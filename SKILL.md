@@ -34,7 +34,7 @@ query + tenant_id + kb_id + request_id
 - `src/rag_skill/pipeline.py`: `RagPipeline` 统一执行检索、重排、生成、缓存和指标。
 - `src/rag_skill/mcp.py`: MCP 工具入口 `rag_answer` / `rag_retrieve`。
 - `src/rag_skill/results.py`: `RagResult` / `RagStatus` 返回契约。
-- `src/rag_skill/stages/`: 缓存、上下文组装、生成、护栏、重排、人工交接等阶段。
+- `src/rag_skill/stages/`: 缓存、上下文组装、生成、护栏、重排等阶段。
 - `tests/`: 使用 fake provider 的契约测试，不依赖外部服务。
 
 ## MCP 工具
@@ -61,13 +61,27 @@ query + tenant_id + kb_id + request_id
 
 | 字段 | 说明 |
 | --- | --- |
-| `status` | `answered` / `answered_cache` / `no_context` / `guard_blocked` / `error` |
-| `message` | 状态说明 |
+| `status` | 机器可读状态码，见下表 |
+| `message` | 状态/错误说明；`error` 时是异常摘要 |
 | `docs` | 精排后的文档；`no_context` / `guard_blocked` 时返回候选文档 |
 | `answer` | 生成或缓存的回答 |
-| `rewritten_query` | 本次实际用于检索的查询文本；未启用改写时等于原始 `query` |
+| `rewritten_query` | 本次实际用于检索的查询文本；改写关闭 / `identity` 时为原始 `query`；显式传 `rewrite_query` 时即为所传文本 |
+
+`status` 标准值（`rag_answer`）：
+
+| status | 含义 | message 约定 | 调用方行为建议 |
+| --- | --- | --- | --- |
+| `answered` | 正常检索并生成回答 | `ok` | 直接使用 `answer` |
+| `answered_cache` | 命中响应缓存，未重新检索/生成 | `ok`（缓存命中） | 直接使用 `answer` |
+| `no_context` | 检索为空或没有文档过相关性阈值 | 说明性文案 | 可结合 `docs` 候选自行判断是否转人工或澄清用户问题 |
+| `guard_blocked` | 回答被生成护栏拦截 | 拦截原因（英文短语，如 `guard_blocked`） | 可改述后重试，或结合候选 `docs` 决定是否转人工 |
+| `error` | 管线内部异常 | 异常摘要 | 视为失败，重试或上报 |
 
 `rag_retrieve` 只做检索，返回 `status`（`retrieved` / `no_context`）、`count`、`docs`。
+
+转人工（handoff）决策与持久化不属于本 skill 的职责：skill 只在
+`no_context` / `guard_blocked` 时把候选 `docs` 随结果返回，是否转人工、
+写到哪个队列 / 库，由调用方 agent 按自身业务规则决定。
 
 ## 配置
 
