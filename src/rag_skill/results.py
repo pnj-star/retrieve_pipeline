@@ -28,6 +28,7 @@ class RagResult:
     message: str
     docs: list[dict[str, Any]] = field(default_factory=list)
     answer: str = ""
+    rewritten_query: str = ""
 
     @property
     def ok(self) -> bool:
@@ -41,6 +42,7 @@ class RagResult:
             "message": self.message,
             "docs": self.docs,
             "answer": self.answer,
+            "rewritten_query": self.rewritten_query,
         }
 
 

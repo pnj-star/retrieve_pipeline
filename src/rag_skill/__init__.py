@@ -37,6 +37,7 @@ from .stages import (
     rank_docs,
     stream_answer,
 )
+from .tokenization import build_token_counter, make_token_counter
 
 __all__ = [
     "ChainHandoffStore",
@@ -56,6 +57,7 @@ __all__ = [
     "build_handoff_record",
     "build_pipeline",
     "build_runtime",
+    "build_token_counter",
     "check_compound_numbers",
     "clean_markdown",
     "create_mcp_server",
@@ -69,6 +71,7 @@ __all__ = [
     "guard_generation",
     "judge_relevance",
     "main",
+    "make_token_counter",
     "persist_handoff",
     "rank_docs",
     "stream_answer",

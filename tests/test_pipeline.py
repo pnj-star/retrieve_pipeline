@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 
 from common_core.config import RuntimeConfig, VectorStoreConfig
 from common_core.context import AgentContext
 from rag_skill.builder import build_pipeline, build_runtime
 from rag_skill.pipeline import DEFAULT_TEXT_OUTPUT_FIELDS, RagPipeline, format_context
 from rag_skill.results import RagStatus
-from rag_skill.stages import GuardConfig, Reranker, ResponseCache
+from rag_skill.stages import (
+    GuardConfig,
+    QueryRewriteConfig,
+    QueryRewriter,
+    Reranker,
+    ResponseCache,
+)
 
 
 class FakeEmbedder:
@@ -159,6 +166,7 @@ def make_pipeline(
     vector: FakeVector,
     *,
     llm: FakeLLM | None = None,
+    query_rewriter: QueryRewriter | None = None,
     cache: FakeCache | None = None,
     response_cache: ResponseCache | None = None,
     reranker: FakeReranker | None = None,
@@ -167,6 +175,7 @@ def make_pipeline(
     tenant_filter: bool = True,
     metrics: FakeMetrics | None = None,
     default_output_fields: tuple[str, ...] | None = None,
+    count_tokens: Callable[[str], int] | None = None,
 ) -> RagPipeline:
     cache = cache or FakeCache()
     return RagPipeline(
@@ -174,6 +183,7 @@ def make_pipeline(
         llm=llm or FakeLLM(),
         vector=vector,
         embedder=FakeEmbedder(),
+        query_rewriter=query_rewriter,
         cache=cache,
         response_cache=response_cache,
         reranker=reranker,
@@ -182,6 +192,7 @@ def make_pipeline(
         tenant_filter=tenant_filter,
         metrics=metrics,
         default_output_fields=default_output_fields,
+        count_tokens=count_tokens,
     )
 
 
@@ -224,7 +235,8 @@ def test_build_pipeline_defaults_include_full_status_stages() -> None:
     assert isinstance(pipeline.response_cache, ResponseCache)
     assert isinstance(pipeline.reranker, Reranker)
     assert isinstance(pipeline.guard_config, GuardConfig)
-    assert pipeline.min_relevance == 0.35
+    assert pipeline.min_relevance == 0.70
+    assert pipeline.count_tokens is not None
 
 
 def test_build_pipeline_can_skip_default_stages() -> None:
@@ -244,6 +256,62 @@ def test_format_context_keeps_relevant_fields() -> None:
     assert "[1]" in text
     assert "first chunk" in text
     assert "score: 0.9" in text
+
+
+def test_format_context_forwards_budget_params(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_build_context_text(docs, **kwargs):
+        captured.update(kwargs)
+        return "context", ["source"]
+
+    monkeypatch.setattr(
+        "rag_skill.pipeline.build_context_text",
+        fake_build_context_text,
+    )
+
+    text = format_context(
+        [{"content": "doc"}],
+        max_chars=120,
+        prefix_blocks=["P" * 20],
+        source_label="url",
+        max_doc_chars=40,
+        max_doc_tokens=30,
+        max_tokens=200,
+        count_tokens=lambda value: len(value),
+    )
+
+    assert text == "context"
+    assert captured["max_chars"] == 120
+    assert captured["prefix_blocks"] == ["P" * 20]
+    assert captured["source_label"] == "url"
+    assert captured["max_doc_chars"] == 40
+    assert captured["max_doc_tokens"] == 30
+    assert captured["max_tokens"] == 200
+    assert captured["count_tokens"] is not None
+
+
+def test_format_context_defaults_token_counter_for_token_budget(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_build_context_text(docs, **kwargs):
+        captured.update(kwargs)
+        return "context", ["source"]
+
+    monkeypatch.setattr(
+        "rag_skill.pipeline.build_context_text",
+        fake_build_context_text,
+    )
+    monkeypatch.setattr("rag_skill.pipeline.build_token_counter", lambda: len)
+
+    text = format_context(
+        [{"content": "doc"}],
+        max_tokens=100,
+    )
+
+    assert text == "context"
+    assert captured["count_tokens"] is len
+    assert captured["max_tokens"] == 100
 
 
 def test_answer_returns_cache_hit_without_calling_providers() -> None:
@@ -396,6 +464,57 @@ def test_retrieve_accepts_explicit_default_output_fields() -> None:
     assert vector.calls[-1]["output_fields"] == ["id", "content"]
 
 
+def test_retrieve_default_off_uses_original_query() -> None:
+    vector = FakeVector([{"id": "1", "content": "doc"}])
+    pipeline = make_pipeline(vector)
+
+    asyncio.run(pipeline.retrieve("原始问题", make_context(), rewrite_trace={}))
+
+    assert vector.calls[-1]["query"] == "原始问题"
+
+
+def test_retrieve_explicit_rewrite_query_skips_rewriting() -> None:
+    vector = FakeVector([{"id": "1", "content": "doc"}])
+    pipeline = make_pipeline(vector)
+    trace: dict = {}
+
+    asyncio.run(
+        pipeline.retrieve(
+            "原始问题",
+            make_context(),
+            rewrite_query="改写后的问题",
+            rewrite_trace=trace,
+        )
+    )
+
+    assert vector.calls[-1]["query"] == "改写后的问题"
+    assert trace["rewritten_query"] == "改写后的问题"
+    assert trace["mode"] == "explicit"
+
+
+def test_retrieve_query_rewrite_mode_overrides_and_writes_trace() -> None:
+    llm = FakeLLM("市场行情与政策")
+    rewriter = QueryRewriter(llm, QueryRewriteConfig(mode="off"))
+    vector = FakeVector([{"id": "1", "content": "doc"}])
+    pipeline = make_pipeline(vector, query_rewriter=rewriter)
+    trace: dict = {}
+
+    docs = asyncio.run(
+        pipeline.retrieve(
+            "了解行情",
+            make_context(),
+            query_rewrite_mode="llm_rewrite",
+            rewrite_trace=trace,
+        )
+    )
+
+    assert docs[0]["id"] == "1"
+    assert vector.calls[-1]["query"] == "市场行情与政策"
+    assert trace["mode"] == "llm_rewrite"
+    assert trace["rewritten_query"] == "市场行情与政策"
+    assert trace["original_query"] == "了解行情"
+
+
 def test_answer_uses_assembly_and_generation_stages() -> None:
     llm = FakeLLM()
     pipeline = make_pipeline(
@@ -417,6 +536,28 @@ def test_answer_uses_assembly_and_generation_stages() -> None:
     assert "[1]" in kwargs["system_prompt"]
     assert "content: doc" in kwargs["system_prompt"]
     assert "business rules" in kwargs["system_prompt"]
+
+
+def test_answer_exposes_rewritten_query() -> None:
+    llm = FakeLLM()
+    pipeline = make_pipeline(
+        FakeVector([{"id": "1", "content": "doc", "score": 0.9}]),
+        llm=llm,
+    )
+
+    result = asyncio.run(
+        pipeline.answer(
+            "原始问题",
+            make_context(),
+            rewrite_query="改写后的问题",
+        )
+    )
+
+    assert result.status == RagStatus.ANSWERED
+    assert result.rewritten_query == "改写后的问题"
+    # 生成仍针对原始用户问题，不因改写而偏离
+    messages, _kwargs = llm.chat_calls[0]
+    assert messages == [{"role": "user", "content": "原始问题"}]
 
 
 def test_answer_generation_failure_is_error_and_not_cached() -> None:
@@ -449,6 +590,62 @@ def test_answer_defaults_context_max_chars_when_none() -> None:
     assert result.status == RagStatus.ANSWERED
 
 
+def test_answer_forwards_token_and_doc_budget(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_build_context_text(docs, **kwargs):
+        captured.update(kwargs)
+        return "context", ["source"]
+
+    monkeypatch.setattr(
+        "rag_skill.pipeline.build_context_text",
+        fake_build_context_text,
+    )
+    pipeline = make_pipeline(FakeVector([{"content": "doc"}]))
+
+    asyncio.run(
+        pipeline.answer(
+            "query",
+            make_context(),
+            context_max_tokens=123,
+            max_doc_chars=45,
+            max_doc_tokens=67,
+            count_tokens=lambda text: len(text),
+        )
+    )
+
+    assert captured["max_tokens"] == 123
+    assert captured["count_tokens"] is not None
+    assert captured["max_doc_chars"] == 45
+    assert captured["max_doc_tokens"] == 67
+
+
+def test_answer_falls_back_to_chars_without_token_counter(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_build_context_text(docs, **kwargs):
+        captured.update(kwargs)
+        return "context", ["source"]
+
+    monkeypatch.setattr(
+        "rag_skill.pipeline.build_context_text",
+        fake_build_context_text,
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "rag_skill.pipeline.logger.warning",
+        lambda *args: warnings.append(str(args)),
+    )
+    pipeline = make_pipeline(FakeVector([{"content": "doc"}]))
+
+    asyncio.run(
+        pipeline.answer("query", make_context(), context_max_tokens=123)
+    )
+
+    assert captured["max_tokens"] is None
+    assert any("token_budget_without_counter" in warning for warning in warnings)
+
+
 def test_pipeline_injects_metrics_into_response_cache() -> None:
     metrics = FakeMetrics()
     cache = FakeCache()
@@ -461,3 +658,80 @@ def test_pipeline_injects_metrics_into_response_cache() -> None:
     )
 
     assert pipeline.response_cache.metrics is metrics
+
+
+def test_answer_caches_under_effective_query_and_avoids_double_rewrite() -> None:
+    """缓存 key 按原始查询 + 改写策略分桶；缓存命中时不再触发改写。"""
+    rewriter_llm = FakeLLM("rewritten query")
+    rewriter = QueryRewriter(rewriter_llm, QueryRewriteConfig(mode="llm_rewrite"))
+    gen_llm = FakeLLM(response="answer text")
+    cache = FakeCache()
+    vector = FakeVector([{"id": "1", "content": "doc", "score": 0.9}])
+    pipeline = make_pipeline(
+        vector,
+        llm=gen_llm,
+        query_rewriter=rewriter,
+        cache=cache,
+        response_cache=ResponseCache(cache, min_cache_chars=0),
+    )
+    ctx = make_context()
+
+    result = asyncio.run(
+        pipeline.answer("original question", ctx, query_rewrite_mode="llm_rewrite")
+    )
+
+    assert result.status == RagStatus.ANSWERED
+    assert result.rewritten_query == "rewritten query"
+    # 改写只解析一次，检索阶段不再重复调用改写 LLM
+    assert len(rewriter_llm.chat_calls) == 1
+    # 生成仍针对原始用户问题
+    assert gen_llm.chat_calls[0][0] == [
+        {"role": "user", "content": "original question"}
+    ]
+    (cached_key,) = cache.store.keys()
+    assert "original question" in cached_key
+    assert "llm_rewrite" in cached_key
+
+    # 第二次请求命中基于改写查询的缓存，不再调用检索/生成
+    vector.calls.clear()
+    gen_llm.chat_calls.clear()
+    hit = asyncio.run(
+        pipeline.answer("original question", ctx, query_rewrite_mode="llm_rewrite")
+    )
+    assert hit.status == RagStatus.ANSWERED_CACHE
+    assert vector.calls == []
+    assert gen_llm.chat_calls == []
+
+
+def test_answer_different_explicit_rewrites_do_not_share_cache_key() -> None:
+    """同一原始查询的不同显式改写应使用不同的缓存 key，避免互相命中。"""
+    gen_llm = FakeLLM(response="answer text")
+    cache = FakeCache()
+    vector = FakeVector([{"id": "1", "content": "doc", "score": 0.9}])
+    pipeline = make_pipeline(
+        vector,
+        llm=gen_llm,
+        cache=cache,
+        response_cache=ResponseCache(cache, min_cache_chars=0),
+    )
+    ctx = make_context()
+
+    asyncio.run(
+        pipeline.answer(
+            "original",
+            ctx,
+            rewrite_query="rewrite A",
+        )
+    )
+    asyncio.run(
+        pipeline.answer(
+            "original",
+            ctx,
+            rewrite_query="rewrite B",
+        )
+    )
+
+    assert len(cache.store) == 2
+    keys = sorted(cache.store.keys())
+    assert "rewrite A" in keys[0]
+    assert "rewrite B" in keys[1]

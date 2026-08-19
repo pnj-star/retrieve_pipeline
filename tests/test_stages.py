@@ -15,6 +15,7 @@ from rag_skill.stages import (
     build_handoff_record,
     check_compound_numbers,
     clean_markdown,
+    dedupe_docs,
     default_template_selector,
     evaluate_guard,
     extract_images,
@@ -210,6 +211,161 @@ def test_build_context_text_dedupes_and_truncates() -> None:
     assert "[Source 2]" in context
     assert "B" not in context
     assert len(sources) == 2
+
+
+def test_build_context_text_truncates_first_doc_instead_of_empty_context() -> None:
+    docs = [{"parent_content": "A" * 9000, "source": "kb.md"}]
+    context, sources = build_context_text(docs, max_chars=120, max_doc_chars=8000)
+    assert context
+    assert len(context) <= 120
+    assert sources == ["kb.md"]
+
+
+def test_build_context_text_counts_prefix_and_separators_in_budget() -> None:
+    docs = [{"content": "a" * 100}, {"content": "b" * 100}]
+    context, sources = build_context_text(
+        docs,
+        max_chars=300,
+        prefix_blocks=["P" * 80],
+        max_doc_chars=200,
+    )
+    assert len(context) <= 300
+    assert sources == ["", "", ""]
+
+
+def test_build_context_text_max_doc_chars_keeps_other_sources() -> None:
+    docs = [
+        {"parent_content": "A" * 2000, "source": "a"},
+        {"parent_content": "B" * 100, "source": "b"},
+    ]
+    context, sources = build_context_text(
+        docs,
+        max_chars=600,
+        max_doc_chars=200,
+        format_doc=lambda index, doc: doc.get("parent_content", ""),
+    )
+    assert "B" in context
+    assert sources == ["a", "b"]
+    assert len(context) <= 600
+
+
+def test_build_context_text_token_budget_with_counter() -> None:
+    def fake_tokens(text: str) -> int:
+        return len(text)
+
+    context, sources = build_context_text(
+        [{"content": "a" * 100}, {"content": "b" * 100}],
+        prefix_blocks=["P" * 20],
+        max_tokens=280,
+        count_tokens=fake_tokens,
+        max_doc_chars=200,
+    )
+    assert len(context) <= 280
+    assert len(sources) == 3
+
+
+def test_build_context_text_caps_oversized_prefix() -> None:
+    context, sources = build_context_text(
+        [{"content": "x"}],
+        max_chars=30,
+        prefix_blocks=["P" * 100],
+        max_doc_chars=100,
+    )
+    assert len(context) <= 30
+    assert sources == [""]
+
+
+def test_dedupe_docs_prefers_parent_id_over_title() -> None:
+    docs = [
+        {"parent_id": "p1", "parent_title": "same", "content": "A"},
+        {"parent_id": "p1", "parent_title": "same", "content": "B"},
+    ]
+    deduped = dedupe_docs(docs)
+    assert len(deduped) == 1
+    assert "A" in deduped[0]["content"]
+
+
+def test_dedupe_docs_keeps_same_title_with_different_parent_id() -> None:
+    docs = [
+        {"parent_id": "p1", "parent_title": "政策 A", "content": "第一份"},
+        {"parent_id": "p2", "parent_title": "政策 A", "content": "第二份"},
+    ]
+    deduped = dedupe_docs(docs)
+    assert len(deduped) == 2
+    assert [doc["parent_id"] for doc in deduped] == ["p1", "p2"]
+
+
+def test_dedupe_docs_falls_back_to_source_and_title() -> None:
+    docs = [
+        {"source": "a.md", "parent_title": "常见问题", "content": "A"},
+        {"source": "a.md", "parent_title": "常见问题", "content": "B"},
+        {"source": "b.md", "parent_title": "常见问题", "content": "C"},
+    ]
+    deduped = dedupe_docs(docs)
+    assert [doc["source"] for doc in deduped] == ["a.md", "b.md"]
+    assert [doc["content"] for doc in deduped] == ["A", "C"]
+
+
+def test_dedupe_docs_explicit_key_takes_priority() -> None:
+    docs = [
+        {"parent_id": "p1", "category": "x", "content": "A"},
+        {"parent_id": "p2", "category": "x", "content": "B"},
+    ]
+    deduped = dedupe_docs(docs, dedupe_key=lambda doc: doc["category"])
+    assert len(deduped) == 1
+    assert deduped[0]["content"] == "A"
+
+
+def test_build_context_text_max_doc_tokens_limits_single_doc() -> None:
+    docs = [
+        {"content": "A" * 200, "source": "a"},
+        {"content": "B" * 200, "source": "b"},
+    ]
+    context, sources = build_context_text(
+        docs,
+        max_tokens=400,
+        count_tokens=len,
+        max_doc_tokens=100,
+    )
+    assert len(context) <= 400
+    assert len(sources) == 2
+    for block in context.split("\n\n---\n\n"):
+        assert len(block) <= 100
+    assert " [truncated]" in context
+
+
+def test_build_context_text_merges_child_chunks_in_chunk_index_order() -> None:
+    docs = [
+        {
+            "parent_id": "p1",
+            "parent_title": "退款规则",
+            "content": "末尾",
+            "chunk_index": 2,
+            "source": "kb.md",
+        },
+        {
+            "parent_id": "p1",
+            "parent_title": "退款规则",
+            "content": "开头",
+            "chunk_index": 1,
+            "source": "kb.md",
+        },
+    ]
+    context, sources = build_context_text(docs, max_chars=200)
+    assert context.index("开头") < context.index("末尾")
+    assert "（退款规则）" in context
+    assert sources == ["kb.md"]
+
+
+def test_build_context_text_uses_parent_content_when_present() -> None:
+    docs = [
+        {"parent_id": "p1", "parent_content": "完整父内容", "content": "子内容"},
+        {"parent_id": "p1", "content": "另一个子块"},
+    ]
+    context, sources = build_context_text(docs, max_chars=200)
+    assert "完整父内容" in context
+    assert "子内容" not in context
+    assert sources == [""]
 
 
 def test_extract_images_dedupes() -> None:

@@ -71,6 +71,8 @@ def create_mcp_server(
         collection_name: str | None = None,
         top_k: int | None = None,
         filter_expr: str | None = None,
+        query_rewrite_mode: str | None = None,
+        rewrite_query: str | None = None,
     ) -> dict[str, Any]:
         """只检索租户范围内的文档，不生成回答。"""
         # 解析租户作用域：校验 JWT（若启用），得到隔离的 AgentContext
@@ -82,12 +84,16 @@ def create_mcp_server(
             user_id=user_id,
             auth_token=auth_token,
         )
+        rewrite_trace: dict[str, Any] = {}
         docs = await pipeline.retrieve(
             query,
             context,
             collection_name=collection_name,
             top_k=top_k,
             filter_expr=filter_expr,
+            query_rewrite_mode=query_rewrite_mode,
+            rewrite_query=rewrite_query,
+            rewrite_trace=rewrite_trace,
         )
         return {
             "ok": True,
@@ -98,6 +104,7 @@ def create_mcp_server(
             "user_id": context.user_id,
             "count": len(docs),
             "docs": docs,
+            "rewritten_query": rewrite_trace.get("rewritten_query", "") or query,
         }
 
     @server.tool()
@@ -117,13 +124,20 @@ def create_mcp_server(
         enable_guard: bool = True,
         prompt_template: str | None = None,
         context_max_chars: int | None = None,
+        context_max_tokens: int | None = None,
+        max_doc_chars: int | None = None,
+        max_doc_tokens: int | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        query_rewrite_mode: str | None = None,
+        rewrite_query: str | None = None,
     ) -> dict[str, Any]:
         """检索、重排并生成回答（走完整 RAG 管线）。
 
         ``prompt_template`` 必须包含 ``{context}``（可含 ``{query}``）；
         ``system_prompt`` 会作为额外指令追加到生成提示，不替换默认模板。
+        ``query_rewrite_mode`` 可覆盖配置的改写策略（off / identity /
+        llm_rewrite / query_expansion）；显式传 ``rewrite_query`` 时跳过改写。
         """
         context = guard.resolve(
             tenant_id=tenant_id,
@@ -144,12 +158,23 @@ def create_mcp_server(
             enable_guard=enable_guard,
             prompt_template=prompt_template,
             context_max_chars=context_max_chars,
+            context_max_tokens=context_max_tokens,
+            max_doc_chars=max_doc_chars,
+            max_doc_tokens=max_doc_tokens,
             temperature=temperature,
             max_tokens=max_tokens,
+            query_rewrite_mode=query_rewrite_mode,
+            rewrite_query=rewrite_query,
         )
         # 兼容底层返回纯字符串的情况（例如自定义管线直接返回回答文本）
         if isinstance(result, str):
-            result = RagResult(RagStatus.ANSWERED, "", [], result)
+            result = RagResult(
+                RagStatus.ANSWERED,
+                "",
+                [],
+                result,
+                rewritten_query=rewrite_query or query,
+            )
         return {
             "ok": result.ok,
             "status": result.status,
@@ -161,6 +186,7 @@ def create_mcp_server(
             "kb_id": context.kb_id,
             "request_id": context.request_id,
             "user_id": context.user_id,
+            "rewritten_query": getattr(result, "rewritten_query", "") or query,
         }
 
     return server

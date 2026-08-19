@@ -34,6 +34,11 @@ from .handoff import (
     default_template_selector,
     persist_handoff,
 )
+from .query_rewrite import (
+    QueryRewriteConfig,
+    QueryRewriteResult,
+    QueryRewriter,
+)
 from .rerank import Reranker, judge_relevance, rank_docs
 
 __all__ = [
@@ -44,6 +49,9 @@ __all__ = [
     "GuardResult",
     "HandoffRecord",
     "HandoffStore",
+    "QueryRewriteConfig",
+    "QueryRewriteResult",
+    "QueryRewriter",
     "RedisHandoffStore",
     "Reranker",
     "ResponseCache",

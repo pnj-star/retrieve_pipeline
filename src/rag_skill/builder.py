@@ -16,6 +16,7 @@ from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompat
 
 from .stages import GuardConfig, RedisHandoffStore, Reranker, ResponseCache
 from .stages.rerank import DEFAULT_RERANK_MODEL
+from .tokenization import build_token_counter
 
 
 def build_runtime(
@@ -133,7 +134,9 @@ def build_pipeline(
 
     - include_defaults=True 时自动注入响应缓存、重排器与默认护栏配置；
       测试场景可传 False 跳过这些阶段（置为 None）。
-    - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker）。
+    - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker、count_tokens 等 RagPipeline 参数）；
+    - count_tokens 推荐使用 ``build_token_counter()``：tiktoken 可用时按真实 token 计数，
+      不可用时回退为字符数。
     """
     from .pipeline import RagPipeline
 
@@ -151,6 +154,7 @@ def build_pipeline(
             build_reranker(runtime, metrics=metrics),
         )
         kwargs.setdefault("guard_config", GuardConfig())
+        kwargs.setdefault("count_tokens", build_token_counter())
     return RagPipeline(
         runtime=runtime,
         metrics=metrics,

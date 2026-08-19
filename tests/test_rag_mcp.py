@@ -24,6 +24,9 @@ class FakePipeline:
         **kwargs,
     ) -> list[dict]:
         self.calls.append({"op": "retrieve", "query": query, "context": context, **kwargs})
+        trace = kwargs.get("rewrite_trace")
+        if isinstance(trace, dict):
+            trace["rewritten_query"] = kwargs.get("rewrite_query") or query
         return [{"content": "doc", "score": 0.9}]
 
     async def answer(
@@ -33,7 +36,13 @@ class FakePipeline:
         **kwargs,
     ) -> RagResult | str:
         self.calls.append({"op": "answer", "query": query, "context": context, **kwargs})
-        return RagResult(RagStatus.ANSWERED, "ok", [], "answer-ok")
+        return RagResult(
+            RagStatus.ANSWERED,
+            "ok",
+            [],
+            "answer-ok",
+            rewritten_query=kwargs.get("rewrite_query") or query,
+        )
 
 
 def _payload(result):
@@ -115,6 +124,9 @@ def test_rag_answer_forwards_generation_options() -> None:
                 "temperature": 0.3,
                 "max_tokens": 128,
                 "context_max_chars": 200,
+                "context_max_tokens": 512,
+                "max_doc_chars": 300,
+                "max_doc_tokens": 150,
                 "prompt_template": "Use {context}",
             },
         )
@@ -124,7 +136,58 @@ def test_rag_answer_forwards_generation_options() -> None:
     assert call["temperature"] == 0.3
     assert call["max_tokens"] == 128
     assert call["context_max_chars"] == 200
+    assert call["context_max_tokens"] == 512
+    assert call["max_doc_chars"] == 300
+    assert call["max_doc_tokens"] == 150
     assert call["prompt_template"] == "Use {context}"
+
+
+def test_rag_answer_forwards_query_rewrite_options() -> None:
+    fake = FakePipeline()
+    server = create_mcp_server(pipeline=fake, auth=AuthConfig(mode="disabled"))
+    result = _run(
+        server.call_tool(
+            "rag_answer",
+            {
+                "query": "原始问题",
+                "tenant_id": "t1",
+                "kb_id": "kb1",
+                "request_id": "r1",
+                "query_rewrite_mode": "llm_rewrite",
+                "rewrite_query": "改写后的问题",
+            },
+        )
+    )
+    payload = _payload(result)
+
+    call = fake.calls[-1]
+    assert call["query_rewrite_mode"] == "llm_rewrite"
+    assert call["rewrite_query"] == "改写后的问题"
+    assert payload["rewritten_query"] == "改写后的问题"
+
+
+def test_rag_retrieve_forwards_query_rewrite_options() -> None:
+    fake = FakePipeline()
+    server = create_mcp_server(pipeline=fake, auth=AuthConfig(mode="disabled"))
+    result = _run(
+        server.call_tool(
+            "rag_retrieve",
+            {
+                "query": "原始问题",
+                "tenant_id": "t1",
+                "kb_id": "kb1",
+                "request_id": "r1",
+                "query_rewrite_mode": "query_expansion",
+                "rewrite_query": "改写后的问题",
+            },
+        )
+    )
+    payload = _payload(result)
+
+    call = fake.calls[-1]
+    assert call["query_rewrite_mode"] == "query_expansion"
+    assert call["rewrite_query"] == "改写后的问题"
+    assert payload["rewritten_query"] == "改写后的问题"
 
 
 class EmptyPipeline(FakePipeline):

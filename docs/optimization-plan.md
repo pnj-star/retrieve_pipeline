@@ -24,7 +24,7 @@
 
 | 优先级 | 缺口 | 说明 |
 | --- | --- | --- |
-| **P0** | 无评测体系 | 无 golden set、无 Recall@k/MRR、无 RAGAS 类生成指标、无调参回归机制。`min_relevance=0.35` 是无数据支撑的默认值（可由 `RETRIEVAL_MIN_RELEVANCE` 覆盖） |
+| **P0** | 无评测体系 | 无 golden set、无 Recall@k/MRR、无 RAGAS 类生成指标、无调参回归机制。`min_relevance=0.70` 是无数据支撑的默认值（可由 `RETRIEVAL_MIN_RELEVANCE` 覆盖） |
 | **P0** | 无端到端链路追踪 | 有 Prometheus 打点，但无 OTel trace/span；`request_id` 只是日志与 metrics 字段，未跨进程贯穿 agent→MCP→管线 |
 | **P1** | 知识治理缺失 | 纯查询侧。无 ingest、无文档版本/过期/发布状态、无"知识更新→缓存失效"机制 |
 | **P1** | 安全能力未接线 | 鉴权/租户隔离已有，但 `security.py` 原语未在查询侧生效；无 IAM/SSO 集成、无审计日志、无全链路 PII 脱敏 |
@@ -73,7 +73,7 @@
 - 建立 20→50→200 条可扩展的 golden set，覆盖检索、生成、护栏、安全四类断言；
 - 产出检索指标（Recall@k / MRR / 命中率）与生成指标（faithfulness / answer relevance，用 RAGAS 或自研 judge）；
 - 每次调参（reranker 模型、`min_relevance`、top_k）自动跑回归并出对比报告；
-- **统计不同 reranker 模型的分数分布**，解构 `0.35` 阈值的模型相关性（bge-reranker-base 与更大模型分数语义不同，阈值不可直接迁移）。
+- **统计不同 reranker 模型的分数分布**，解构 `0.70` 阈值的模型相关性（bge-reranker-base 与更大模型分数语义不同，阈值不可直接迁移）。
 
 ### 4.2 交付物与文件布局（建议新增于 monorepo 顶层）
 
@@ -85,7 +85,7 @@ Skill/
 │     ├─ golden_set.yaml          # 黄金数据集（标注了期望检索 doc 与期望回答要点）
 │     ├─ metrics.py               # Recall@k、MRR、命中率
 │     ├─ generate_metrics.py      # faithfulness / answer relevance 的 judge 实现（RAGAS 或内置）
-│     ├─ score_distribution.py    # 各模型 rerank ce_score 分布统计（服务 0.35 调参）
+│     ├─ score_distribution.py    # 各模型 rerank ce_score 分布统计（服务 0.70 调参）
 │     ├─ run_pipeline_eval.py     # 注入 fake/真实 provider 跑一次完整的检索+生成+护栏评测
 │     ├─ comparable_report.py     # 两次评测对比（阈值/模型 A/B），输出 md 报告
 │     └─ gate.py                  # 回归门禁：指标劣化超阈值则 CI 失败
@@ -103,7 +103,7 @@ Skill/
        expected_retrieval: ["chunk_售后_01"]   # 期望检索命中的 chunk
        expected_answer_keywords: ["退货", "7天"]
        assert_no_absolute_words: true          # 断言无绝对化用语
-       min_ce_score: 0.5                        # 期望精排最低分（若配置了 reranker）
+       min_ce_score: 0.70                        # 期望精排最低分（若配置了 reranker）
    ```
    来源：从 merchant 实例的历史线上问题 + 业务痛点人工标注；条目按领域分桶（售后/结算/规则/兜底）。
 2. **实现检索指标**：`metrics.py` 对 golden set 跑 `rag_retrieve`，计算 Recall@k（期望 chunk 是否在 top-k）与 MRR。
