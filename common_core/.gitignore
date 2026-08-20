@@ -1,0 +1,29 @@
+# IDE / editor local config
+.idea/
+.vscode/
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files / secrets
+.env
+.env.*
+!.env.example
+
+# Misc
+.DS_Store

@@ -17,7 +17,7 @@ if __name__ == "__main__" and not __package__:
     mcp_file = Path(__file__).resolve()
     for src_dir in (
         mcp_file.parents[1],                            # rag_skill/src
-        mcp_file.parents[3] / "common_core" / "src",    # 同仓库 common_core/src
+        mcp_file.parents[2] / "common_core" / "src",    # 同仓库 common_core/src
     ):
         if src_dir.exists():
             sys.path.insert(0, str(src_dir))

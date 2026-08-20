@@ -3,6 +3,6 @@
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1].parent
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "common_core" / "src"))
-sys.path.insert(0, str(ROOT / "rag_skill" / "src"))
+sys.path.insert(0, str(ROOT / "src"))

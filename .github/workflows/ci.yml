@@ -24,8 +24,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install package with test extras
-        run: python -m pip install -e ".[test]"
+      - name: Install test dependencies
+        run: python -m pip install pytest prometheus-client pyjwt tiktoken
+
+      - name: Install package (editable, runtime deps only)
+        run: python -m pip install -e . --no-deps
 
       - name: Run tests
         run: python -m pytest
