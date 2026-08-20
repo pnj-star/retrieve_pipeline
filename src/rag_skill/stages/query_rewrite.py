@@ -36,12 +36,28 @@ DEFAULT_QUERY_EXPANSION_PROMPT = (
 
 
 def normalize_query_rewrite_mode(mode: str | None, default: str = "off") -> str:
-    """规范化改写策略；未知值回退到 default。"""
+    """规范化改写策略；未知值回退到 default。
+
+    参数:
+        mode: 原始改写模式（可能为 None 或未知值）。
+        default: 未知 / 空值时的回退模式，默认 "off"。
+
+    返回:
+        归一化后的合法改写模式字符串。
+    """
     value = str(mode or "").strip().lower()
     return value if value in VALID_QUERY_REWRITE_MODES else default
 
 
 def _strip_fences(text: str) -> str:
+    """去掉 LLM 返回内容外围的 ``` 代码块围栏，只留内部正文。
+
+    参数:
+        text: LLM 返回的原始内容。
+
+    返回:
+        去掉外层围栏后的正文；无围栏时原样返回去首尾空白的文本。
+    """
     stripped = text.strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
@@ -51,6 +67,14 @@ def _strip_fences(text: str) -> str:
 
 
 def _clean_query_line(line: str) -> str:
+    """清理单条查询：去掉列表前缀（- * • 或 1. 1、）与多余引号。
+
+    参数:
+        line: 单条查询的原始文本行。
+
+    返回:
+        清理后的查询文本；空行返回空字符串。
+    """
     cleaned = line.strip()
     if not cleaned:
         return ""
@@ -59,7 +83,14 @@ def _clean_query_line(line: str) -> str:
 
 
 def _parse_query_variants(raw: str) -> list[str]:
-    """解析 LLM 输出的多个查询，兼容 JSON、代码块与逐行文本。"""
+    """解析 LLM 输出的多个查询，兼容 JSON、代码块与逐行文本。
+
+    参数:
+        raw: LLM 返回的原始文本。
+
+    返回:
+        解析出的查询文本去重列表；无法解析时为空列表。
+    """
     text = _strip_fences(raw)
     if not text:
         return []
@@ -92,7 +123,15 @@ def _parse_query_variants(raw: str) -> list[str]:
 
 @dataclass(slots=True)
 class QueryRewriteResult:
-    """一次查询改写的结果，供检索与排查使用。"""
+    """一次查询改写的结果，供检索与排查使用。
+
+    字段:
+        mode: 本次生效的改写模式。
+        original_query: 改写前的原始用户查询。
+        rewritten_query: 改写后实际用于检索的主查询（回退时等于原查询）。
+        query_variants: 检索使用的查询变体列表（展开模式含多个）。
+        error: 改写过程中的错误信息；无错误时为空字符串。
+    """
 
     mode: str
     original_query: str
@@ -101,6 +140,12 @@ class QueryRewriteResult:
     error: str = ""
 
     def to_trace(self) -> dict[str, Any]:
+        """把这次改写结果拍平成日志 / 排障用的字典。
+
+        返回:
+            包含 mode / original_query / rewritten_query / query_variants
+            （以及可选的 error）的字典。
+        """
         trace: dict[str, Any] = {
             "mode": self.mode,
             "original_query": self.original_query,
@@ -122,6 +167,13 @@ class QueryRewriter:
         *,
         metrics: Any = None,
     ) -> None:
+        """持有改写要用的 LLM、配置与指标对象；未传配置时用默认值。
+
+        参数:
+            llm: 用于改写的底层 LLM 客户端。
+            config: 查询改写配置；None 用默认 QueryRewriteConfig()。
+            metrics: 可观测性 / 指标对象；可为 None。
+        """
         self.llm = llm
         self.config = config or QueryRewriteConfig()
         self.metrics = metrics
@@ -131,6 +183,18 @@ class QueryRewriter:
         context: AgentContext | None = None,
         requested_mode: str | None = None,
     ) -> str:
+        """综合请求参数与配置，算出本次实际生效的改写模式。
+
+        优先级：调用方显式传的 ``requested_mode`` > 租户/KB 作用域的
+        ``scoped_modes`` > 全局默认 ``mode``。归一化后返回一个合法模式。
+
+        参数:
+            context: agent 上下文；非空时用于按租户/KB 查 scoped_modes。
+            requested_mode: 调用方显式指定的模式；None 时按配置决定。
+
+        返回:
+            归一化后的合法改写模式。
+        """
         explicit = normalize_query_rewrite_mode(requested_mode, default=self.config.mode)
         if requested_mode is not None:
             return explicit
@@ -151,7 +215,11 @@ class QueryRewriter:
         )
 
     def _llm_for_rewrite(self) -> Any:
-        """llm_model 为空时复用管线 LLM，否则构造同配置但不同模型的客户端。"""
+        """llm_model 为空时复用管线 LLM，否则构造同配置但不同模型的客户端。
+
+        返回:
+            本次改写实际要用的 LLM 客户端。
+        """
         if not self.config.llm_model:
             return self.llm
         current_model = getattr(getattr(self.llm, "config", None), "model", "")
@@ -180,6 +248,16 @@ class QueryRewriter:
         *,
         mode: str | None = None,
     ) -> QueryRewriteResult:
+        """对外入口：改写一条查询，任何异常都回退为原查询，绝不阻塞检索。
+
+        参数:
+            query: 原始用户查询。
+            context: agent 上下文；可为 None。
+            mode: 本次显式指定的改写模式；None 时按配置决定。
+
+        返回:
+            QueryRewriteResult；异常时改写结果回退到原查询并记录 error。
+        """
         resolved = self.resolve_mode(context, requested_mode=mode)
         try:
             return await self._rewrite_impl(query, resolved)
@@ -203,6 +281,15 @@ class QueryRewriter:
         query: str,
         mode: str,
     ) -> QueryRewriteResult:
+        """按解析出的模式分发到具体的改写实现。
+
+        参数:
+            query: 原始用户查询。
+            mode: 已解析并归一化的改写模式。
+
+        返回:
+            QueryRewriteResult，含改写后的查询与变体列表。
+        """
         if mode in {"off", "identity"}:
             return QueryRewriteResult(
                 mode=mode,
@@ -228,6 +315,15 @@ class QueryRewriter:
         query: str,
         mode: str,
     ) -> QueryRewriteResult:
+        """单查询改写：让 LLM 产出一个更适合检索的查询文本。
+
+        参数:
+            query: 原始用户查询。
+            mode: 改写模式（用于结果记录）。
+
+        返回:
+            QueryRewriteResult，改写失败则回退到原查询并记录 error。
+        """
         prompt = self.config.rewrite_prompt or DEFAULT_QUERY_REWRITE_PROMPT
         raw = await self._llm_for_rewrite().chat(
             [{"role": "user", "content": query}],
@@ -255,6 +351,15 @@ class QueryRewriter:
         query: str,
         mode: str,
     ) -> QueryRewriteResult:
+        """查询扩展：让 LLM 产出多个不同角度的检索查询以提升召回。
+
+        参数:
+            query: 原始用户查询。
+            mode: 改写模式（用于结果记录）。
+
+        返回:
+            QueryRewriteResult；主查询取首个扩展，query_variants 含原查询与扩展。
+        """
         count = max(1, self.config.expand_count)
         prompt = (
             self.config.expansion_prompt

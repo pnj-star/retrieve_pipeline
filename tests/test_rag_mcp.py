@@ -88,6 +88,51 @@ def test_rag_answer_passes_scope_to_pipeline() -> None:
     )
 
 
+def test_rag_answer_accepts_traceparent_and_returns_trace_id() -> None:
+    fake = FakePipeline()
+    server = create_mcp_server(pipeline=fake, auth=AuthConfig(mode="disabled"))
+    result = _run(
+        server.call_tool(
+            "rag_answer",
+            {
+                "query": "what is the policy?",
+                "tenant_id": "t1",
+                "kb_id": "kb1",
+                "request_id": "r1",
+                "traceparent": (
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-"
+                    "00f067aa0ba902b7-01"
+                ),
+            },
+        )
+    )
+    payload = _payload(result)
+    # 无论 OTel 是否启用，返回契约都必须稳定且带 trace_id 字段
+    assert payload["answer"] == "answer-ok"
+    assert payload["status"] == "answered"
+    assert "trace_id" in payload
+
+
+def test_rag_retrieve_accepts_traceparent_and_returns_trace_id() -> None:
+    fake = FakePipeline()
+    server = create_mcp_server(pipeline=fake, auth=AuthConfig(mode="disabled"))
+    result = _run(
+        server.call_tool(
+            "rag_retrieve",
+            {
+                "query": "policy lookup",
+                "tenant_id": "t2",
+                "kb_id": "kb2",
+                "request_id": "r2",
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            },
+        )
+    )
+    payload = _payload(result)
+    assert payload["docs"][0]["content"] == "doc"
+    assert "trace_id" in payload
+
+
 def test_rag_retrieve_passes_scope_and_top_k() -> None:
     fake = FakePipeline()
     server = create_mcp_server(pipeline=fake, auth=AuthConfig(mode="disabled"))

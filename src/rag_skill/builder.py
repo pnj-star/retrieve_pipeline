@@ -15,8 +15,14 @@ from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 
 from .stages import Reranker, ResponseCache
-from .stages.rerank import DEFAULT_RERANK_MODEL
 from .tokenization import build_token_counter
+
+
+# 模型应尽量从本地 HuggingFace 缓存加载，避免首次推理去访问 HF_ENDPOINT
+# （如 hf-mirror.com）做联网检查而卡住几十秒。默认关联网检查，仅用本地缓存；
+# 若确实需要联网下载，可显式设 HF_HUB_OFFLINE=0 / TRANSFORMERS_OFFLINE=0。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 
 def build_runtime(
@@ -27,9 +33,13 @@ def build_runtime(
 ) -> RuntimeConfig:
     """从环境变量构建统一的运行时配置。
 
-    - env: 可选，用字典显式提供/覆盖环境变量；
-    - dotenv_paths: 可选的 .env 文件路径列表；
-    - override: 加载 .env 时是否覆盖已存在的环境变量。
+    参数:
+        env: 可选字典，显式提供/覆盖环境变量后传给 RuntimeConfig。
+        dotenv_paths: 可选的 .env 文件路径列表，存在则先加载。
+        override: 加载 .env 时是否覆盖已存在的环境变量，默认 False。
+
+    返回:
+        统一的 RuntimeConfig 配置对象。
     """
     if dotenv_paths:
         load_env_files(*dotenv_paths, override=override)
@@ -42,13 +52,28 @@ def build_llm(
     *,
     metrics: Observability | None = None,
 ) -> OpenAICompatibleLLM:
-    """构建 OpenAI 兼容的 LLM 客户端，未传 runtime 时自动从环境构建。"""
+    """构建 OpenAI 兼容的 LLM 客户端，未传 runtime 时自动从环境构建。
+
+    参数:
+        runtime: 运行时配置；None 时用 build_runtime() 从环境构建。
+        metrics: 可观测性 / 指标对象，挂载到 LLM 上；可为 None。
+
+    返回:
+        OpenAICompatibleLLM 实例。
+    """
     runtime = runtime or build_runtime()
     return OpenAICompatibleLLM(runtime.llm, metrics=metrics)
 
 
 def build_vector(runtime: RuntimeConfig | None = None) -> MilvusVectorStore:
-    """构建 Milvus 向量库客户端，支持混合检索（稀疏 + 稠密）。"""
+    """构建 Milvus 向量库客户端，支持混合检索（稀疏 + 稠密）。
+
+    参数:
+        runtime: 运行时配置；None 时从环境构建。
+
+    返回:
+        配置好并发度的 MilvusVectorStore 实例。
+    """
     runtime = runtime or build_runtime()
     return MilvusVectorStore(
         runtime.vector,
@@ -57,7 +82,14 @@ def build_vector(runtime: RuntimeConfig | None = None) -> MilvusVectorStore:
 
 
 def build_embedder(runtime: RuntimeConfig | None = None) -> LocalEmbedder:
-    """构建本地 Embedding 模型，用于把查询转成稠密向量。"""
+    """构建本地 Embedding 模型，用于把查询转成稠密向量。
+
+    参数:
+        runtime: 运行时配置；None 时从环境构建。
+
+    返回:
+        LocalEmbedder 实例。
+    """
     runtime = runtime or build_runtime()
     return LocalEmbedder(config=runtime.llm)
 
@@ -67,7 +99,15 @@ def build_cache(
     *,
     shared: bool = True,
 ) -> RedisCache:
-    """构建底层 Redis 缓存（响应缓存共用）。"""
+    """构建底层 Redis 缓存（响应缓存共用）。
+
+    参数:
+        runtime: 运行时配置；None 时从环境构建。
+        shared: 是否使用共享连接，默认 True。
+
+    返回:
+        RedisCache 实例。
+    """
     runtime = runtime or build_runtime()
     return RedisCache(runtime.cache, shared=shared)
 
@@ -80,14 +120,26 @@ def build_reranker(
 ) -> Reranker:
     """构建交叉编码器重排器。
 
-    模型名取自环境变量 ``RERANKER_MODEL``（默认 bge-reranker-base），
-    设备取 ``RERANKER_DEVICE``；可通过 overrides 覆盖 top_k、score_fn 等。
+    模型名、融合权重与 top_k 均取自 ``runtime.retrieval``（其默认值由
+    common_core 的 RetrievalConfig 提供，来源 RERANKER_MODEL、
+    RERANKER_CE_WEIGHT、RERANKER_RETRIEVAL_WEIGHT、RERANK_TOP_K）。
+    设备仍取 ``RERANKER_DEVICE``；可通过 overrides 覆盖 top_k、score_fn 等。
+
+    参数:
+        runtime: 运行时配置；None 时从环境构建（用于取 rerank_top_k）。
+        metrics: 可观测性 / 指标对象；可为 None。
+        overrides: 透传给 Reranker 构造器的额外参数（可覆盖 top_k、score_fn 等）。
+
+    返回:
+        配置好的 Reranker 实例。
     """
     runtime = runtime or build_runtime()
     return Reranker(
-        model_name=os.getenv("RERANKER_MODEL", DEFAULT_RERANK_MODEL),
+        model_name=runtime.retrieval.rerank_model,
         device=os.getenv("RERANKER_DEVICE"),
         top_k=runtime.retrieval.rerank_top_k,
+        ce_weight=runtime.retrieval.rerank_ce_weight,
+        retrieval_weight=runtime.retrieval.rerank_retrieval_weight,
         metrics=metrics,
         **overrides,
     )
@@ -100,7 +152,17 @@ def build_response_cache(
     metrics: Observability | None = None,
     **overrides: Any,
 ) -> ResponseCache:
-    """构建租户隔离的响应缓存，复用底层 Redis 缓存连接。"""
+    """构建租户隔离的响应缓存，复用底层 Redis 缓存连接。
+
+    参数:
+        runtime: 运行时配置；None 时从环境构建。
+        cache: 底层 Redis 缓存实例；None 时用 build_cache(runtime) 构建。
+        metrics: 可观测性 / 指标对象；可为 None。
+        overrides: 透传给 ResponseCache 构造器的额外参数。
+
+    返回:
+        配置好的 ResponseCache 实例。
+    """
     runtime = runtime or build_runtime()
     return ResponseCache(
         cache or build_cache(runtime),
@@ -124,6 +186,16 @@ def build_pipeline(
     - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker、count_tokens 等 RagPipeline 参数）；
     - count_tokens 推荐使用 ``build_token_counter()``：tiktoken 可用时按真实 token 计数，
       不可用时回退为字符数。
+
+    参数:
+        runtime: 运行时配置；None 时从环境构建。
+        metrics: 可观测性 / 指标对象；可为 None。
+        include_defaults: 是否自动注入响应缓存、重排器与 token 计数；
+            测试场景可传 False 跳过这些阶段（对应组件置为 None）。
+        overrides: 透传给 RagPipeline 构造器的参数；与默认注入的组件冲突时以显式传入为准。
+
+    返回:
+        组装好的 RagPipeline 实例。
     """
     from .pipeline import RagPipeline
 

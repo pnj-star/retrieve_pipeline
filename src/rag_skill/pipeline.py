@@ -60,7 +60,16 @@ DEFAULT_TEXT_OUTPUT_FIELDS: tuple[str, ...] = (
 def merge_retrieval_docs(
     results: Iterable[Iterable[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """把多个查询的检索结果按文档身份合并，保留首次出现顺序与最高分数。"""
+    """把多个查询的检索结果按文档身份合并，保留首次出现顺序与最高分数。
+
+    参数:
+        results: 多个检索批次的可迭代对象；每个批次是文档字典的列表。
+            文档按 "id" 字段判重，若 "id" 缺失则改用
+            (tenant_id, kb_id, source, content) 的组合作为身份键。
+
+    返回:
+        合并去重后的文档列表；同身份文档保留首次出现顺序，各分数取最高值。
+    """
     merged: dict[Any, dict[str, Any]] = {}
     for batch in results:
         for doc in batch:
@@ -92,13 +101,34 @@ def _format_doc(index: int, doc: dict[str, Any]) -> str:
 
     优先使用父块内容（parent_content），其次使用当前块内容（content）；
     再用 source / category / score 补充来源与相关性信息。
+
+    参数:
+        index: 文档在上下文中的序号，输出时作为 [index] 前缀。
+        doc: 单篇检索返回的文档字典，支持 parent_content、content、
+            source、category、score 等字段。
+
+    返回:
+        格式化后的单行上下文文本。
     """
     content = str(doc.get("parent_content", "") or doc.get("content", "") or "")
+    return _render_fields(
+        index,
+        {
+            "content": clean_markdown(content) if content.strip() else None,
+            "source": doc.get("source"),
+            "category": doc.get("category"),
+            "score": doc.get("score"),
+        },
+    )
+
+
+def _render_fields(index: int, fields: dict[str, Any]) -> str:
+    """把有序字段渲染成 `[index] | 字段: 值` 的单行上下文片段。
+
+    所有调用方共用的渲染骨架：字段值为空或空白时跳过，避免输出 ``field: `` 空壳。
+    """
     parts = [f"[{index}]"]
-    if content.strip():
-        parts.append(f"content: {clean_markdown(content)}")
-    for field_name in ("source", "category", "score"):
-        value = doc.get(field_name)
+    for field_name, value in fields.items():
         if value is not None and str(value).strip():
             parts.append(f"{field_name}: {value}")
     return " | ".join(parts)
@@ -121,14 +151,32 @@ def format_context(
     预算参数与 ``build_context_text`` 对齐：max_chars / max_tokens 控制总体上限，
     max_doc_chars / max_doc_tokens 控制单篇（或同一父块合并后）上限；
     传了 max_tokens 且未传 count_tokens 时，自动使用 build_token_counter()。
+
+    参数:
+        docs: 待拼接的文档字典可迭代对象。
+        include_fields: 每个文档要输出的字段名列表，按顺序渲染成 "字段: 值"。
+        max_chars: 整个上下文的最大字符数上限。
+        prefix_blocks: 放在上下文最前面的固定文本块（如系统指引），可为 None。
+        source_label: 主标识字段名，在 build_context_text 内用于控制文档分组。
+        max_doc_chars: 单篇（或合并后同源块）的最大字符数；None 表示不限制。
+        max_doc_tokens: 单篇（或合并后同源块）的最大 token 数；None 表示不限制。
+        max_tokens: 整个上下文的最大 token 数；需配合 count_tokens 使用。
+        count_tokens: 把字符串换算成 token 数的函数；未传且用了 max_tokens 时自动构建。
+
+    返回:
+        拼接好的上下文文本字符串。
     """
     def _format(index: int, doc: dict[str, Any]) -> str:
-        parts = [f"[{index}]"]
-        for field_name in include_fields:
-            value = doc.get(field_name)
-            if value is not None and str(value).strip():
-                parts.append(f"{field_name}: {value}")
-        return " | ".join(parts)
+        """把单个文档按 include_fields 渲染成一行，前面带 [序号]。
+
+        参数:
+            index: 当前文档序号。
+            doc: 单个文档字典。
+
+        返回:
+            格式化后的单行文本。
+        """
+        return _render_fields(index, {name: doc.get(name) for name in include_fields})
 
     if max_tokens is not None and count_tokens is None:
         count_tokens = build_token_counter()
@@ -176,6 +224,24 @@ class RagPipeline:
         count_tokens: Callable[[str], int] | None = None,
         default_output_fields: Iterable[str] | None = None,
     ) -> None:
+        """组装整条 RAG 管线：未显式注入的组件从 runtime 配置默认构建。
+
+        参数:
+            runtime: common_core 的运行配置；未传则从环境变量构建。
+            llm: OpenAI 兼容 LLM 实例，用于生成回答；未传用 runtime.llm 默认构建。
+            vector: Milvus 向量库实例，用于混合检索；未传则默认构建。
+            embedder: 本地 Embedding 模型，用于生成查询向量；未传则默认构建。
+            cache: Redis 底层缓存实例（供响应缓存复用连接）；未传则默认构建。
+            metrics: 可观测性 / 指标上报对象；为 None 则不上报指标。
+            reranker: 交叉编码器精排器；None 表示不启用精排。
+            response_cache: 响应缓存实例；None 表示不启用响应缓存。
+            guard_config: 质量护栏配置；None 表示默认无护栏配置。
+            query_rewriter: 查询改写器；None 则用默认 QueryRewriter。
+            min_relevance: 精排后的最低相关性阈值；None 时用 runtime 默认值。
+            tenant_filter: 是否强制按 tenant_id/kb_id 做隔离过滤，默认 True。
+            count_tokens: 字符串转 token 数函数，用于 token 预算控制；None 用默认。
+            default_output_fields: 检索默认返回的字段；None 用 runtime/内置默认值。
+        """
         self.runtime = runtime or RuntimeConfig.from_env()
         self.metrics = metrics
         self.llm = llm or OpenAICompatibleLLM(self.runtime.llm, metrics=metrics)
@@ -215,7 +281,14 @@ class RagPipeline:
         )
 
     def _context_labels(self, context: AgentContext | None) -> tuple[str, str, str, str]:
-        """取出用于指标 / 日志打点的租户上下文标签。"""
+        """取出用于指标 / 日志打点的租户上下文标签。
+
+        参数:
+            context: agent 上下文；可能为 None（无租户信息）。
+
+        返回:
+            (tenant_id, kb_id, request_id, session_id) 四元组，缺省时为空字符串。
+        """
         if context is None:
             return "", "", "", ""
         return (
@@ -226,7 +299,13 @@ class RagPipeline:
         )
 
     def _observe(self, node: str, start: float, context: AgentContext | None) -> None:
-        """记录某个环节（node）的耗时指标。"""
+        """记录某个环节（node）的耗时指标。
+
+        参数:
+            node: 环节名称，如 "retrieve" / "query_rewrite" / "rerank"。
+            start: 该环节开始时刻（time.perf_counter() 的返回值）。
+            context: agent 上下文，用于提取租户标签；可为 None。
+        """
         if self.metrics is None:
             return
         tenant_id, kb_id, _request_id, _session_id = self._context_labels(context)
@@ -238,7 +317,12 @@ class RagPipeline:
         )
 
     def _observe_error(self, node: str, context: AgentContext | None) -> None:
-        """记录某个环节（node）的错误指标。"""
+        """记录某个环节（node）的错误指标。
+
+        参数:
+            node: 环节名称。
+            context: agent 上下文，用于提取租户标签；可为 None。
+        """
         if self.metrics is None:
             return
         tenant_id, kb_id, _request_id, _session_id = self._context_labels(context)
@@ -257,6 +341,13 @@ class RagPipeline:
 
         最终产出形如 `tenant_id == "x" and kb_id == "y" and (业务条件)` 的表达式，
         传给 Milvus 做过滤检索，确保检索永远不会跨越租户范围。
+
+        参数:
+            context: agent 上下文；非空且 tenant_filter 开启时生成租户隔离条件。
+            filter_expr: 调用方传入的额外业务过滤表达式；为空字符串则忽略。
+
+        返回:
+            合并后的 Milvus 过滤表达式字符串；无任何条件时返回空字符串。
         """
         parts: list[str] = []
         if self.tenant_filter and context is not None:
@@ -282,8 +373,22 @@ class RagPipeline:
         query_rewrite_mode: str | None,
         rewrite_query: str | None,
     ) -> QueryRewriteResult:
-        """Resolve the effective query (explicit rewrite or configured strategy) once,
-        reporting rewrite timing. Reused by both retrieve() and _answer_impl()."""
+        """只解析一次“最终生效的查询”，并上报改写耗时。
+
+        - 显式传入了 ``rewrite_query`` 时直接采用它，跳过 LLM；
+        - 否则按配置的改写策略执行一次查询改写。
+        该方法被 ``retrieve()`` 和 ``_answer_impl()`` 共用，保证整条管线
+        在同一处统一处理改写，避免两处逻辑分叉。
+
+        参数:
+            query: 原始用户查询文本。
+            context: agent 上下文，改写器可能按租户取改写配置。
+            query_rewrite_mode: 本次显式指定的改写模式；None 时按配置决定。
+            rewrite_query: 显式传入的改写后查询；非空时直接采用并跳过 LLM。
+
+        返回:
+            QueryRewriteResult，包含最终生效查询、改写模式与变体列表等信息。
+        """
         if rewrite_query is not None and str(rewrite_query).strip():
             effective_query = str(rewrite_query).strip()
             return QueryRewriteResult(
@@ -312,9 +417,23 @@ class RagPipeline:
         mode: str,
         rewrite_query: str | None,
     ) -> str:
-        """Build the response-cache key. Default/identity keeps the original query,
-        so cache hits skip re-rewriting; explicit rewrite queries and rewrite-changing
-        modes get their own bucket and never collide on the same original query."""
+        """构造响应缓存用的 key，决定哪些请求共享/隔离同一个缓存。
+
+        设计要点：
+        - ``off`` / ``identity`` 保持原查询为 key，这样缓存命中时连改写都不用跑；
+        - 显式传入的 ``rewrite_query`` 会把 key 绑定到该改写文本上，避免不同
+          改写内容之间互相串缓存；
+        - 会改变查询文本的改写模式（如 ``llm_rewrite``）也单独开一个桶，
+          保证同一个原始问题不会因模式不同而错误地命中同一条缓存。
+
+        参数:
+            query: 原始用户查询文本。
+            mode: 最终生效的改写模式（off/identity/llm_rewrite/query_expansion 等）。
+            rewrite_query: 显式传入的改写后查询；None 表示没有。
+
+        返回:
+            用于区分缓存分桶的字符串 key。
+        """
         key = str(query).strip()
         explicit = None if rewrite_query is None else str(rewrite_query).strip()
         if explicit:
@@ -334,7 +453,25 @@ class RagPipeline:
         output_fields: Iterable[str],
         filter_expr: str | None,
     ) -> list[dict[str, Any]]:
-        """Run hybrid search from an already-resolved rewrite result."""
+        """基于已经解析好的改写结果执行稀疏 + 稠密的混合检索。
+
+        改写结果里通常只有一个查询；展开模式（query_expansion）会带多个变体。
+        - 单个查询：直接做一次混合检索；
+        - 多个变体：对每个变体各检索一次，再用 ``merge_retrieval_docs`` 按文档
+          身份合并、取最高分，最终截断到 top_k，提升召回覆盖面。
+
+        参数:
+            query: 原始用户查询文本（用于追溯）。
+            context: agent 上下文，用于租户隔离过滤。
+            result: 已解析好的改写结果，含最终查询与查询变体列表。
+            collection: 目标 Milvus 集合名。
+            top_k: 每个查询返回的候选条数。
+            output_fields: 检索需要返回的字段列表。
+            filter_expr: 额外的业务过滤表达式；为空则不附加。
+
+        返回:
+            融合/合并并按 top_k 截断后的候选文档列表。
+        """
         scope_filter = self._build_scope_filter(context, filter_expr)
         field_list = list(output_fields)
         search_queries = result.query_variants or [result.rewritten_query]
@@ -385,6 +522,21 @@ class RagPipeline:
         查询改写支持 ``off`` / ``identity`` / ``llm_rewrite`` / ``query_expansion``；
         改写失败自动回退原始查询，不影响检索可用性。显式传入 ``rewrite_query``
         时跳过改写，直接用该文本检索。改写明细会写入 ``rewrite_trace``（若有）。
+
+        参数:
+            query: 用户查询文本。
+            context: agent 上下文；可为 None（表示无租户隔离）。
+            collection_name: 覆盖默认的 Milvus 集合名；None 用 runtime 配置。
+            top_k: 返回候选条数；None 用 runtime 默认值。
+            output_fields: 覆盖默认返回字段；None 用管线默认字段。
+            filter_expr: 额外的业务过滤表达式。
+            query_rewrite_mode: 本次指定的改写模式；None 按配置决定。
+            rewrite_query: 显式改写后的查询；非空时跳过内置改写。
+            rewrite_trace: 可选字典，改写明细会写入其中供排查。
+            _resolved_rewrite: 内部复用已解析改写结果，调用方通常不需要传。
+
+        返回:
+            候选文档字典列表（每项含检索字段与分数等信息）。
         """
         collection = collection_name or self.runtime.vector.text_collection
         if not collection:
@@ -442,6 +594,7 @@ class RagPipeline:
         query: str,
         context: AgentContext | None = None,
         *,
+        collection_name: str | None = None,
         system_prompt: str = "",
         top_k: int | None = None,
         output_fields: Iterable[str] | None = None,
@@ -465,6 +618,32 @@ class RagPipeline:
 
         任何内部异常都会被转换为 ``status=error`` 的 RagResult，并记录日志与
         指标，保证调用方（如 MCP 层）始终拿到稳定的返回契约。
+
+        参数:
+            query: 用户的问题文本。
+            context: agent 上下文；可为 None。
+            system_prompt: 附加在生成 prompt 里的系统指令，追加在模板之后。
+            top_k: 检索候选条数；None 用默认值。
+            output_fields: 检索返回字段覆盖；None 用管线默认。
+            filter_expr: 额外业务过滤表达式。
+            query_rewrite_mode: 改写模式；None 按配置决定。
+            rewrite_query: 显式改写后的查询；非空时跳过内置改写。
+            collection_name: 覆盖默认的 Milvus 集合名；None 用 runtime 配置。
+            empty_answer: 无可用上下文时返回的占位回答文案。
+            temperature: LLM 采样温度；None 用模型/配置默认。
+            max_tokens: 生成最大 token 数；None 用模型/配置默认。
+            min_relevance: 本次最低相关性阈值覆盖；None 用管线默认。
+            guard_config: 本次护栏配置覆盖；None 用管线默认。
+            enable_guard: 是否启用护栏阶段，默认 True。
+            prompt_template: 覆盖默认生成 prompt 模板。
+            context_max_chars: 上下文最大字符数。
+            context_max_tokens: 上下文最大 token 数（需 count_tokens 支持）。
+            count_tokens: 字符串转 token 数函数。
+            max_doc_chars: 单篇文档最大字符数。
+            max_doc_tokens: 单篇文档最大 token 数。
+
+        返回:
+            包含状态、回答、候选文档与改写信息的 RagResult。
         """
         tenant_id, kb_id, request_id, session_id = self._context_labels(context)
         if self.metrics is not None:
@@ -474,6 +653,7 @@ class RagPipeline:
             result = await self._answer_impl(
                 query,
                 context,
+                collection_name=collection_name,
                 system_prompt=system_prompt,
                 top_k=top_k,
                 output_fields=output_fields,
@@ -526,6 +706,7 @@ class RagPipeline:
         query: str,
         context: AgentContext | None,
         *,
+        collection_name: str | None,
         system_prompt: str,
         top_k: int | None,
         output_fields: Iterable[str] | None,
@@ -545,7 +726,12 @@ class RagPipeline:
         max_doc_chars: int | None,
         max_doc_tokens: int | None,
     ) -> RagResult:
-        """RAG 核心流水线（不含 answer 的异常兜底包装）。"""
+        """RAG 核心流水线（不含 answer 的异常兜底包装）。
+
+        参数语义与 ``answer()`` 完全一致，全部为关键字参数，唯一的区别是：
+        这里不做异常兜底，内部异常会直接向上抛出，由外层 ``answer()``
+        统一转换成 ``status=error`` 的稳定返回。
+        """
         tenant_id, kb_id, request_id, session_id = self._context_labels(context)
         logger.info(
             "rag.answer.start tenant_id=%s kb_id=%s request_id=%s session_id=%s trace_id=%s",
@@ -592,6 +778,7 @@ class RagPipeline:
         docs = await self.retrieve(
             query,
             context,
+            collection_name=collection_name,
             top_k=top_k,
             output_fields=output_fields,
             filter_expr=filter_expr,
@@ -675,7 +862,16 @@ class RagPipeline:
         node_name = "guard" if (enable_guard and cfg is not None) else "generate"
 
         async def _generate(q: str, ctx_text: str, guard_reason: str) -> str:
-            """真正调用 LLM 生成回答；护栏重试时会回传上次未通过的原因。"""
+            """真正调用 LLM 生成回答；护栏重试时会回传上次未通过的原因。
+
+            参数:
+                q: 要回答的用户查询。
+                ctx_text: 已拼好的上下文文本。
+                guard_reason: 上一次护栏未通过的原因；为空表示首次生成。
+
+            返回:
+                LLM 生成的回答字符串。
+            """
             instructions = system_prompt.strip()
             if guard_reason:
                 instructions = (

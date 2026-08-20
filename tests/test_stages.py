@@ -334,6 +334,18 @@ def test_build_context_text_uses_parent_content_when_present() -> None:
     assert sources == [""]
 
 
+def test_build_context_text_dedupes_duplicate_child_chunks() -> None:
+    docs = [
+        {"parent_id": "p1", "parent_title": "规则", "content": "相同块", "chunk_index": 1},
+        {"parent_id": "p1", "parent_title": "规则", "content": "相同块", "chunk_index": 2},
+        {"parent_id": "p1", "parent_title": "规则", "content": "不同块", "chunk_index": 3},
+    ]
+    context, sources = build_context_text(docs, max_chars=200)
+    assert context.count("相同块") == 1
+    assert "不同块" in context
+    assert sources == [""]
+
+
 def test_extract_images_dedupes() -> None:
     images = [{"image_url": "img1"}, {"image_url": "img1"}, {"url": "img2"}]
     docs = [{"image_urls": ["img3", "img1"]}]
@@ -494,4 +506,3 @@ def test_response_cache_records_metrics() -> None:
         "skip",
         "hit",
     ]
-

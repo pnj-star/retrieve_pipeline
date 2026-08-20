@@ -12,11 +12,15 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Iterable, Sequence
 
-# 拼入上下文的默认字符上限，防止超出模型上下文窗口
-DEFAULT_MAX_CONTEXT_CHARS = 8000
-# 上下文各块之间的分隔符（同时计入预算）
+from common_core.config import RetrievalConfig
+
+
+_ASSEMBLY_DEFAULTS = RetrievalConfig()
+DEFAULT_MAX_CONTEXT_CHARS = _ASSEMBLY_DEFAULTS.assembly_max_context_chars
+
+# 上下文各块之间的分隔符（同时计入预算）。
 CONTEXT_SEPARATOR = "\n\n---\n\n"
-# 截断时追加的提示标记，告知 LLM 这段内容被砍断了
+# 截断时追加的提示标记，告知 LLM 这段内容被砍断了。
 TRUNCATION_MARKER = " [truncated]"
 
 
@@ -31,6 +35,12 @@ def clean_markdown(text: str) -> str:
     1. 把 ``**x**`` 里的加粗符号剥掉只留内容；
     2. 把行首的 ``#``~``######`` 标题标记删掉（用 re.M 逐行匹配）；
     3. 全局删除反引号。
+
+    参数:
+        text: 待清理的原始文本（常为知识块正文）。
+
+    返回:
+        清理掉加粗、行首标题与反引号后的文本。
     """
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
@@ -55,6 +65,14 @@ def _truncate_to_limit(
     3. 预算够放截断标记时：用二分查找"前缀 + 标记"不超过预算的最大长度，
        （二分保证结果一定合法，避免逐字符试带来的 O(n) 开销）；
     4. 预算连标记都放不下 → 退化为纯前缀（不带标记），同样二分。
+
+    参数:
+        text: 待截断的文本。
+        limit: 允许的最大计量值（字符数或 token 数）上限。
+        measure: 把字符串换算成计量值的函数，如 len 或 count_tokens。
+
+    返回:
+        不超过 limit 的截断结果；必要时会带 "[truncated]" 标记。
     """
     if limit <= 0 or not text:
         return ""
@@ -95,6 +113,14 @@ def _render_doc(
     - 有 format_doc：完全交给调用方格式化（如带上 score / source 附注）；
     - 无 format_doc：输出 ``[Source N] 清理后的正文``，正文优先取父块
       parent_content（整篇），取不到再退回当前块 content。
+
+    参数:
+        index: 文档在上下文中的序号，用作 [Source N] 前缀。
+        doc: 单篇检索返回的文档字典。
+        format_doc: 可选的自定义格式化函数，(index, doc) -> str。
+
+    返回:
+        渲染好的单条上下文文本。
     """
     if format_doc is not None:
         return format_doc(index, doc)
@@ -110,6 +136,12 @@ def _parent_scope(doc: dict[str, Any]) -> str:
     为什么要有它：同一个 parent_title 或长得很像的内容可能出现在不同的
     租户 / 知识库 / 文档里，光按 title 分组会把它们错误地并成一组。
     用 NUL 字符（\x00）连接三段作为分隔符是安全的——正常文本不会包含 NUL。
+
+    参数:
+        doc: 单篇文档字典。
+
+    返回:
+        由 tenant_id / kb_id / source 拼接成的分组作用域字符串。
     """
     parts = []
     for field in ("tenant_id", "kb_id", "source"):
@@ -125,6 +157,12 @@ def _stable_parent_key(doc: dict[str, Any]) -> str:
     2. 其次：parent_title（标题通常唯一）→ scope + title:xxx；
     3. 再其次：内容前 60 字符作为指纹 → scope + content:xxx[:60]；
     4. 全都拿不到 → 返回 ""（调用方会跳过它，不参与去重/分组）。
+
+    参数:
+        doc: 单篇文档字典。
+
+    返回:
+        稳定父块身份 key；无法识别时返回空字符串。
     """
     parent_id = str(doc.get("parent_id", "") or "").strip()
     scope = _parent_scope(doc)  # 先算作用域，保证不同租户/文档不会互相碰撞
@@ -147,6 +185,12 @@ def _group_docs(docs: Sequence[dict[str, Any]]) -> list[tuple[str, list[dict[str
 
     逻辑：用 dict 存组 + 独立 order 列表记住第一次出现的顺序；
     无法生成身份 key 的文档直接跳过（不会成为一组）。
+
+    参数:
+        docs: 待分组的文档序列。
+
+    返回:
+        [(身份 key, 该组文档列表), ...] 列表，按首现顺序排列。
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
@@ -168,6 +212,13 @@ def _chunk_index(doc: dict[str, Any], position: int) -> tuple[int, int]:
     - 有合法 chunk_index → 按它排序；
     - 没有 / 非法 → 用 2**31（视为"排在最后"）+ 原始位置兜底，
       保证同批非法序号之间仍按输入顺序排，不出现随机抖动。
+
+    参数:
+        doc: 单篇文档字典，读取其 chunk_index 字段。
+        position: 文档在输入里的原始位置，作为同序号时的稳定兜底。
+
+    返回:
+        (排序号, 原始位置) 二元组，可直接交给 sorted() 的 key。
     """
     raw = doc.get("chunk_index")
     try:
@@ -190,6 +241,14 @@ def _render_group(
        去掉空块后用空行合并成一段；有 format_doc 时再造一个
        "synthetic" 文档（content=合并结果）交回给调用方格式化，
        否则输出 ``[Source N]（标题）\n合并内容``。
+
+    参数:
+        index: 组在上下文中的序号，用作 [Source N] 前缀。
+        group: 同一父块的子块文档列表。
+        format_doc: 可选的自定义格式化函数，(index, doc) -> str。
+
+    返回:
+        渲染好的该组上下文文本；无可用内容时返回空字符串。
     """
     # 父块路线：找到第一个带 parent_content 的文档（用它的全文，忽略其余子块内容）
     parent_doc = next(
@@ -211,7 +270,19 @@ def _render_group(
         clean_markdown(str(doc.get("content", "") or "")).strip()
         for _position, doc in children
     ]
-    contents = [item for item in contents if item]
+    contents = [
+        item
+        for item in contents
+        if item
+    ]
+    # 子块按"清理后的完整内容"去重并保序，避免重叠切窗产生的内容重复喂给 LLM
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in contents:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    contents = deduped
     if not contents:
         return ""
     combined = "\n\n".join(contents)
@@ -238,6 +309,13 @@ def dedupe_docs(
 
     逻辑：遍历并维护一个 seen 集合；key 为空或已见过 → 跳过，否则保留。
     保留的是"该父块第一个出现的文档"。
+
+    参数:
+        docs: 待去重的文档序列。
+        dedupe_key: 可选的自定义身份 key 函数；未传时使用稳定父块身份。
+
+    返回:
+        去重后的文档列表（保留首现顺序）。
     """
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
@@ -395,6 +473,15 @@ def extract_images(
     逻辑：先从图片检索结果（images）里按 url_fields 依次找 url，
     再从文本文档（docs）的 image_urls 字段里收集，两轮都保持原始顺序且
     只保留第一次出现的 URL；最后截断到 max_images 张。
+
+    参数:
+        docs: 文本文档列表，读取其 image_urls 字段。
+        images: 图片检索结果列表；图片 URL 优先从这里收集。
+        max_images: 返回的最大图片数量上限，默认 5。
+        url_fields: 从图片结果中尝试读取 URL 的字段名顺序。
+
+    返回:
+        去重并按顺序截断后的图片 URL 列表。
     """
     urls: list[str] = []
     for image in images:

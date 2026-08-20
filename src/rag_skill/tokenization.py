@@ -12,7 +12,14 @@ DEFAULT_TIKTOKEN_ENCODING = "cl100k_base"
 
 
 def make_token_counter(encoding: Any) -> Callable[[str], int]:
-    """用已加载的 tiktoken encoding 构造 ``str -> token 数`` 的计数器。"""
+    """用已加载的 tiktoken encoding 构造 ``str -> token 数`` 的计数器。
+
+    参数:
+        encoding: 已加载的 tiktoken 编码对象，用于把文本切成 token。
+
+    返回:
+        接收文本、返回 token 数的函数。
+    """
     return lambda text: len(encoding.encode(text))
 
 
@@ -27,6 +34,13 @@ def build_token_counter(
     - model 传入时按模型名选编码（例如 ``gpt-4o``）；
     - 未传 model 时使用 ``cl100k_base``；
     - 未安装 tiktoken 或编码不可用时，回退到 fallback（默认按字符数）。
+
+    参数:
+        model: 可选的模型名，用于选择对应的 tiktoken 编码。
+        fallback: 可选的备用计数函数；tiktoken 不可用时调用它。默认按字符数。
+
+    返回:
+        可注入 ``count_tokens`` 的计数函数。
     """
     counter = fallback or len
     try:
