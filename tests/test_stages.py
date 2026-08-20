@@ -1,14 +1,11 @@
-"""各阶段（stages）单元测试：覆盖重排、上下文组装、生成、护栏与
-响应缓存的契约行为，使用 fake LLM / 缓存 / 存储。"""
+"""各阶段（stages）单元测试：覆盖重排、上下文组装、生成与护栏，
+生成/护栏部分验证共享 common_core.rag 的契约行为。"""
 
 import asyncio
 
-from common_core.context import AgentContext
-from rag_skill.stages import (
+from common_core.rag import (
     GenerationConfig,
     GuardConfig,
-    Reranker,
-    ResponseCache,
     build_context_text,
     check_compound_numbers,
     clean_markdown,
@@ -17,6 +14,9 @@ from rag_skill.stages import (
     extract_images,
     generate_answer,
     guard_generation,
+)
+from rag_skill.stages import (
+    Reranker,
     judge_relevance,
     rank_docs,
 )
@@ -69,66 +69,6 @@ class FakeLLM:
     ):
         for chunk in ("part1 ", "part2"):
             yield chunk
-
-
-class FakeCache:
-    def __init__(self) -> None:
-        self.store: dict[str, str] = {}
-
-    def key(
-        self,
-        scope: str,
-        material: str,
-        *,
-        tenant_id: str = "",
-        kb_id: str = "",
-    ) -> str:
-        return f"{tenant_id}:{kb_id}:{scope}:{material}"
-
-    def get(
-        self,
-        scope: str,
-        material: str,
-        *,
-        tenant_id: str = "",
-        kb_id: str = "",
-    ) -> str | None:
-        return self.store.get(self.key(scope, material, tenant_id=tenant_id, kb_id=kb_id))
-
-    def set(
-        self,
-        scope: str,
-        material: str,
-        value: str,
-        *,
-        ttl: int | None = None,
-        tenant_id: str = "",
-        kb_id: str = "",
-    ) -> bool:
-        self.store[self.key(scope, material, tenant_id=tenant_id, kb_id=kb_id)] = value
-        return True
-
-    def delete(
-        self,
-        scope: str,
-        material: str,
-        *,
-        tenant_id: str = "",
-        kb_id: str = "",
-    ) -> bool:
-        key = self.key(scope, material, tenant_id=tenant_id, kb_id=kb_id)
-        return self.store.pop(key, None) is not None
-class FakeMetrics:
-    def __init__(self) -> None:
-        self.cache_events: list[tuple[str, str, str]] = []
-
-    def record_cache(
-        self,
-        result: str,
-        tenant_id: str = "",
-        kb_id: str = "",
-    ) -> None:
-        self.cache_events.append((result, tenant_id, kb_id))
 
 
 def test_rank_docs_sorts_and_truncates() -> None:
@@ -465,44 +405,3 @@ def test_guard_generation_retries_until_pass() -> None:
     assert "vague" in seen_reasons[1]
     assert "too short" in seen_reasons[2]
     assert response == "answer 3"
-
-def test_response_cache_tenant_isolation() -> None:
-    cache = FakeCache()
-    rc = ResponseCache(cache)
-    ctx = AgentContext(tenant_id="t1", kb_id="kb1")
-    assert rc.put("question", "a longer cached answer here", context=ctx)
-    assert (
-        rc.get("question", context=ctx)
-        == "a longer cached answer here"
-    )
-    assert (
-        rc.get("question", context=AgentContext(tenant_id="t2", kb_id="kb1"))
-        is None
-    )
-
-
-def test_response_cache_skips_short_fallback() -> None:
-    rc = ResponseCache(FakeCache())
-    assert rc.put("q", "short") is False
-
-
-def test_response_cache_records_metrics() -> None:
-    metrics = FakeMetrics()
-    cache = FakeCache()
-    rc = ResponseCache(cache, metrics=metrics)
-    ctx = AgentContext(tenant_id="t1", kb_id="kb1")
-
-    assert rc.get("question", context=ctx) is None
-    assert rc.put("question", "a sufficiently long answer", context=ctx)
-    assert rc.put("short", "x", context=ctx) is False
-
-    assert [event[0] for event in metrics.cache_events] == ["miss", "write", "skip"]
-    assert metrics.cache_events[1][1:] == ("t1", "kb1")
-
-    assert rc.get("question", context=ctx) is not None
-    assert [event[0] for event in metrics.cache_events] == [
-        "miss",
-        "write",
-        "skip",
-        "hit",
-    ]

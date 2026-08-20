@@ -9,13 +9,12 @@ from common_core.config import RuntimeConfig, VectorStoreConfig
 from common_core.context import AgentContext
 from rag_skill.builder import build_pipeline, build_runtime
 from rag_skill.pipeline import DEFAULT_TEXT_OUTPUT_FIELDS, RagPipeline, format_context
-from rag_skill.results import RagStatus
+from rag_skill.results import RetrieveStatus
 from rag_skill.stages import (
-    GuardConfig,
     QueryRewriteConfig,
     QueryRewriter,
     Reranker,
-    ResponseCache,
+    RetrievalCache,
 )
 
 
@@ -168,9 +167,8 @@ def make_pipeline(
     llm: FakeLLM | None = None,
     query_rewriter: QueryRewriter | None = None,
     cache: FakeCache | None = None,
-    response_cache: ResponseCache | None = None,
+    retrieval_cache: RetrievalCache | None = None,
     reranker: FakeReranker | None = None,
-    guard_config: GuardConfig | None = None,
     min_relevance: float | None = None,
     tenant_filter: bool = True,
     metrics: FakeMetrics | None = None,
@@ -185,9 +183,8 @@ def make_pipeline(
         embedder=FakeEmbedder(),
         query_rewriter=query_rewriter,
         cache=cache,
-        response_cache=response_cache,
+        retrieval_cache=retrieval_cache,
         reranker=reranker,
-        guard_config=guard_config,
         min_relevance=min_relevance,
         tenant_filter=tenant_filter,
         metrics=metrics,
@@ -232,26 +229,15 @@ def test_build_pipeline_constructs_providers() -> None:
 
 def test_build_pipeline_defaults_include_stages() -> None:
     pipeline = build_pipeline(runtime=build_runtime(env={}))
-    assert isinstance(pipeline.response_cache, ResponseCache)
+    assert isinstance(pipeline.retrieval_cache, RetrievalCache)
     assert isinstance(pipeline.reranker, Reranker)
-    assert pipeline.guard_config is None  # guard 默认关闭，按需启用
     assert pipeline.min_relevance == 0.70
     assert pipeline.count_tokens is not None
 
 
-def test_build_pipeline_guard_can_be_enabled_explicitly() -> None:
-    pipeline = build_pipeline(
-        runtime=build_runtime(env={}),
-        guard_config=GuardConfig(),
-    )
-    assert isinstance(pipeline.guard_config, GuardConfig)
-
-
 def test_build_pipeline_can_skip_default_stages() -> None:
     pipeline = build_pipeline(runtime=build_runtime(env={}), include_defaults=False)
-    assert pipeline.response_cache is None
     assert pipeline.reranker is None
-    assert pipeline.guard_config is None
 
 
 def test_format_context_keeps_relevant_fields() -> None:
@@ -320,96 +306,6 @@ def test_format_context_defaults_token_counter_for_token_budget(monkeypatch) -> 
     assert text == "context"
     assert captured["count_tokens"] is len
     assert captured["max_tokens"] == 100
-
-
-def test_answer_returns_cache_hit_without_calling_providers() -> None:
-    llm = FakeLLM()
-    vector = FakeVector([{"content": "doc"}])
-    cache = FakeCache()
-    response_cache = ResponseCache(cache, min_cache_chars=0)
-    pipeline = make_pipeline(
-        vector,
-        llm=llm,
-        cache=cache,
-        response_cache=response_cache,
-    )
-    ctx = make_context()
-    response_cache.put("what is policy", "cached answer " * 3, context=ctx)
-
-    result = asyncio.run(pipeline.answer("what is policy", ctx))
-
-    assert result.status == RagStatus.ANSWERED_CACHE
-    assert result.answer == "cached answer " * 3
-    assert vector.calls == []
-    assert llm.chat_calls == []
-
-
-def test_answer_reports_no_context_when_retrieval_empty() -> None:
-    pipeline = make_pipeline(
-        FakeVector(),
-        response_cache=ResponseCache(FakeCache(), min_cache_chars=0),
-    )
-
-    result = asyncio.run(
-        pipeline.answer("missing", make_context(), empty_answer="没有找到相关内容")
-    )
-
-    assert result.status == RagStatus.NO_CONTEXT
-    assert result.docs == []
-    assert result.answer == "没有找到相关内容"
-
-
-def test_answer_blocks_below_relevance_threshold() -> None:
-    llm = FakeLLM()
-    vector = FakeVector([{"id": "1", "content": "weak doc"}])
-    reranker = FakeReranker(
-        [{"id": "1", "content": "weak doc", "ce_score": 0.1, "score": 0.1}]
-    )
-    pipeline = make_pipeline(vector, llm=llm, reranker=reranker, min_relevance=0.5)
-
-    result = asyncio.run(pipeline.answer("query", make_context()))
-
-    assert result.status == RagStatus.NO_CONTEXT
-    assert llm.chat_calls == []
-    assert result.docs[0]["ce_score"] == 0.1
-
-
-def test_guard_blocked_returned_without_caching() -> None:
-    llm = FakeLLM(response="绝对最低价，无副作用")
-    cache = FakeCache()
-    pipeline = make_pipeline(
-        FakeVector([{"id": "1", "content": "doc", "ce_score": 0.9}]),
-        llm=llm,
-        cache=cache,
-        response_cache=ResponseCache(cache, min_cache_chars=0),
-        reranker=FakeReranker([{"id": "1", "content": "doc", "ce_score": 0.9}]),
-        guard_config=GuardConfig(),
-    )
-
-    result = asyncio.run(pipeline.answer("query", make_context()))
-
-    assert result.status == RagStatus.GUARD_BLOCKED
-    assert "绝对" in result.answer
-    assert cache.store == {}
-
-
-def test_answer_passes_guard_and_caches() -> None:
-    llm = FakeLLM(response="请参照平台规则，以实际结算单为准。")
-    cache = FakeCache()
-    pipeline = make_pipeline(
-        FakeVector([{"id": "1", "content": "doc", "ce_score": 0.9}]),
-        llm=llm,
-        cache=cache,
-        response_cache=ResponseCache(cache, min_cache_chars=10),
-        reranker=FakeReranker([{"id": "1", "content": "doc", "ce_score": 0.9}]),
-        guard_config=GuardConfig(),
-    )
-
-    result = asyncio.run(pipeline.answer("query", make_context()))
-
-    assert result.status == RagStatus.ANSWERED
-    assert result.answer == "请参照平台规则，以实际结算单为准。"
-    assert len(cache.store) == 1
 
 
 def test_retrieve_injects_tenant_and_kb_filter() -> None:
@@ -523,223 +419,117 @@ def test_retrieve_query_rewrite_mode_overrides_and_writes_trace() -> None:
     assert trace["original_query"] == "了解行情"
 
 
-def test_answer_uses_assembly_and_generation_stages() -> None:
-    llm = FakeLLM()
+def test_build_pipeline_defaults_include_retrieval_cache() -> None:
+    pipeline = build_pipeline(runtime=build_runtime(env={}))
+    assert isinstance(pipeline.retrieval_cache, RetrievalCache)
+
+
+def test_retrieve_context_cache_hit_skips_providers() -> None:
+    vector = FakeVector([{"id": "1", "content": "doc", "ce_score": 0.95}])
+    retrieval_cache = RetrievalCache(FakeCache())
     pipeline = make_pipeline(
-        FakeVector([{"id": "1", "content": "doc", "score": 0.9}]),
-        llm=llm,
+        vector,
+        retrieval_cache=retrieval_cache,
+        reranker=FakeReranker([{"id": "1", "content": "doc", "ce_score": 0.95}]),
     )
+    ctx = make_context()
+    retrieval_cache.put("what is policy", [{"id": "1", "content": "cached doc"}], context=ctx)
 
-    result = asyncio.run(
-        pipeline.answer(
-            "query",
-            make_context(),
-            system_prompt="business rules",
-        )
+    result = asyncio.run(pipeline.retrieve_context("what is policy", ctx))
+
+    assert result.status == RetrieveStatus.RETRIEVED_CACHE
+    assert result.cache_hit is True
+    assert result.docs == [{"id": "1", "content": "cached doc"}]
+    assert vector.calls == []
+
+
+def test_retrieve_context_miss_rewrites_retrieves_reranks_and_caches() -> None:
+    rewriter_llm = FakeLLM("rewritten query")
+    rewriter = QueryRewriter(rewriter_llm, QueryRewriteConfig(mode="llm_rewrite"))
+    vector = FakeVector(
+        [
+            {"id": "1", "content": "high", "score": 0.8},
+            {"id": "2", "content": "low", "score": 0.5},
+        ]
     )
-
-    assert result.status == RagStatus.ANSWERED
-    messages, kwargs = llm.chat_calls[0]
-    assert messages == [{"role": "user", "content": "query"}]
-    assert "[1]" in kwargs["system_prompt"]
-    assert "content: doc" in kwargs["system_prompt"]
-    assert "business rules" in kwargs["system_prompt"]
-
-
-def test_answer_exposes_rewritten_query() -> None:
-    llm = FakeLLM()
-    pipeline = make_pipeline(
-        FakeVector([{"id": "1", "content": "doc", "score": 0.9}]),
-        llm=llm,
+    reranker = FakeReranker(
+        [
+            {"id": "1", "content": "high", "score": 0.9, "ce_score": 0.95},
+            {"id": "2", "content": "low", "score": 0.5, "ce_score": 0.2},
+        ]
     )
-
-    result = asyncio.run(
-        pipeline.answer(
-            "原始问题",
-            make_context(),
-            rewrite_query="改写后的问题",
-        )
-    )
-
-    assert result.status == RagStatus.ANSWERED
-    assert result.rewritten_query == "改写后的问题"
-    # 生成仍针对原始用户问题，不因改写而偏离
-    messages, _kwargs = llm.chat_calls[0]
-    assert messages == [{"role": "user", "content": "原始问题"}]
-
-
-def test_answer_generation_failure_is_error_and_not_cached() -> None:
-    llm = FakeLLM(fail_chat=True)
     cache = FakeCache()
+    retrieval_cache = RetrievalCache(cache)
     pipeline = make_pipeline(
-        FakeVector([{"id": "1", "content": "doc"}]),
-        llm=llm,
-        cache=cache,
-        response_cache=ResponseCache(cache, min_cache_chars=0),
+        vector,
+        query_rewriter=rewriter,
+        retrieval_cache=retrieval_cache,
+        reranker=reranker,
+        min_relevance=0.5,
+    )
+    ctx = make_context()
+
+    result = asyncio.run(
+        pipeline.retrieve_context("original", ctx, query_rewrite_mode="llm_rewrite")
     )
 
-    result = asyncio.run(pipeline.answer("query", make_context()))
+    assert result.status == RetrieveStatus.RETRIEVED
+    assert result.rewritten_query == "rewritten query"
+    # 改写在缓存未命中后、混合检索前发生一次
+    assert len(rewriter_llm.chat_calls) == 1
+    assert vector.calls[-1]["query"] == "rewritten query"
+    # 只返回精排后达标文档（低于阈值的 doc2 被过滤掉）
+    assert [doc["id"] for doc in result.docs] == ["1"]
+    # 检索缓存回写的是精排后达标文档
+    cached = retrieval_cache.get("original\u001fllm_rewrite", context=ctx)
+    assert cached is not None
+    assert [doc["id"] for doc in cached] == ["1"]
 
-    assert result.status == RagStatus.ERROR
+
+def test_retrieve_context_empty_hybrid_returns_no_context() -> None:
+    pipeline = make_pipeline(
+        FakeVector(),
+        retrieval_cache=RetrievalCache(FakeCache()),
+        reranker=FakeReranker(),
+    )
+
+    result = asyncio.run(pipeline.retrieve_context("nothing", make_context()))
+
+    assert result.status == RetrieveStatus.NO_CONTEXT
+    assert result.docs == []
+
+
+def test_retrieve_context_all_below_threshold_returns_no_context_and_skips_cache() -> None:
+    vector = FakeVector([{"id": "1", "content": "weak", "score": 0.3}])
+    reranker = FakeReranker(
+        [{"id": "1", "content": "weak", "score": 0.3, "ce_score": 0.1}]
+    )
+    cache = FakeCache()
+    retrieval_cache = RetrievalCache(cache)
+    pipeline = make_pipeline(
+        vector,
+        retrieval_cache=retrieval_cache,
+        reranker=reranker,
+        min_relevance=0.5,
+    )
+    ctx = make_context()
+
+    result = asyncio.run(pipeline.retrieve_context("query", ctx))
+
+    assert result.status == RetrieveStatus.NO_CONTEXT
+    # no_context 时仍返回候选文档供 agent 判断是否转人工
+    assert result.docs[0]["id"] == "1"
     assert cache.store == {}
 
 
-def test_answer_defaults_context_max_chars_when_none() -> None:
-    llm = FakeLLM()
-    pipeline = make_pipeline(
-        FakeVector([{"id": "1", "content": "doc", "score": 0.9}]),
-        llm=llm,
-    )
-
-    result = asyncio.run(
-        pipeline.answer("query", make_context(), context_max_chars=None)
-    )
-
-    assert result.status == RagStatus.ANSWERED
-
-
-def test_answer_forwards_token_and_doc_budget(monkeypatch) -> None:
-    captured: dict = {}
-
-    def fake_build_context_text(docs, **kwargs):
-        captured.update(kwargs)
-        return "context", ["source"]
-
-    monkeypatch.setattr(
-        "rag_skill.pipeline.build_context_text",
-        fake_build_context_text,
-    )
-    pipeline = make_pipeline(FakeVector([{"content": "doc"}]))
-
-    asyncio.run(
-        pipeline.answer(
-            "query",
-            make_context(),
-            context_max_tokens=123,
-            max_doc_chars=45,
-            max_doc_tokens=67,
-            count_tokens=lambda text: len(text),
-        )
-    )
-
-    assert captured["max_tokens"] == 123
-    assert captured["count_tokens"] is not None
-    assert captured["max_doc_chars"] == 45
-    assert captured["max_doc_tokens"] == 67
-
-
-def test_answer_falls_back_to_chars_without_token_counter(monkeypatch) -> None:
-    captured: dict = {}
-
-    def fake_build_context_text(docs, **kwargs):
-        captured.update(kwargs)
-        return "context", ["source"]
-
-    monkeypatch.setattr(
-        "rag_skill.pipeline.build_context_text",
-        fake_build_context_text,
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        "rag_skill.pipeline.logger.warning",
-        lambda *args: warnings.append(str(args)),
-    )
-    pipeline = make_pipeline(FakeVector([{"content": "doc"}]))
-
-    asyncio.run(
-        pipeline.answer("query", make_context(), context_max_tokens=123)
-    )
-
-    assert captured["max_tokens"] is None
-    assert any("token_budget_without_counter" in warning for warning in warnings)
-
-
-def test_pipeline_injects_metrics_into_response_cache() -> None:
-    metrics = FakeMetrics()
-    cache = FakeCache()
-    response_cache = ResponseCache(cache, min_cache_chars=0)
-    pipeline = make_pipeline(
-        FakeVector([{"id": "1"}]),
-        cache=cache,
-        response_cache=response_cache,
-        metrics=metrics,
-    )
-
-    assert pipeline.response_cache.metrics is metrics
-
-
-def test_answer_caches_under_effective_query_and_avoids_double_rewrite() -> None:
-    """缓存 key 按原始查询 + 改写策略分桶；缓存命中时不再触发改写。"""
-    rewriter_llm = FakeLLM("rewritten query")
-    rewriter = QueryRewriter(rewriter_llm, QueryRewriteConfig(mode="llm_rewrite"))
-    gen_llm = FakeLLM(response="answer text")
-    cache = FakeCache()
+def test_retrieve_context_no_reranker_passes_docs_through() -> None:
     vector = FakeVector([{"id": "1", "content": "doc", "score": 0.9}])
-    pipeline = make_pipeline(
-        vector,
-        llm=gen_llm,
-        query_rewriter=rewriter,
-        cache=cache,
-        response_cache=ResponseCache(cache, min_cache_chars=0),
-    )
-    ctx = make_context()
-
-    result = asyncio.run(
-        pipeline.answer("original question", ctx, query_rewrite_mode="llm_rewrite")
-    )
-
-    assert result.status == RagStatus.ANSWERED
-    assert result.rewritten_query == "rewritten query"
-    # 改写只解析一次，检索阶段不再重复调用改写 LLM
-    assert len(rewriter_llm.chat_calls) == 1
-    # 生成仍针对原始用户问题
-    assert gen_llm.chat_calls[0][0] == [
-        {"role": "user", "content": "original question"}
-    ]
-    (cached_key,) = cache.store.keys()
-    assert "original question" in cached_key
-    assert "llm_rewrite" in cached_key
-
-    # 第二次请求命中基于改写查询的缓存，不再调用检索/生成
-    vector.calls.clear()
-    gen_llm.chat_calls.clear()
-    hit = asyncio.run(
-        pipeline.answer("original question", ctx, query_rewrite_mode="llm_rewrite")
-    )
-    assert hit.status == RagStatus.ANSWERED_CACHE
-    assert vector.calls == []
-    assert gen_llm.chat_calls == []
-
-
-def test_answer_different_explicit_rewrites_do_not_share_cache_key() -> None:
-    """同一原始查询的不同显式改写应使用不同的缓存 key，避免互相命中。"""
-    gen_llm = FakeLLM(response="answer text")
     cache = FakeCache()
-    vector = FakeVector([{"id": "1", "content": "doc", "score": 0.9}])
-    pipeline = make_pipeline(
-        vector,
-        llm=gen_llm,
-        cache=cache,
-        response_cache=ResponseCache(cache, min_cache_chars=0),
-    )
-    ctx = make_context()
+    retrieval_cache = RetrievalCache(cache)
+    pipeline = make_pipeline(vector, retrieval_cache=retrieval_cache)
 
-    asyncio.run(
-        pipeline.answer(
-            "original",
-            ctx,
-            rewrite_query="rewrite A",
-        )
-    )
-    asyncio.run(
-        pipeline.answer(
-            "original",
-            ctx,
-            rewrite_query="rewrite B",
-        )
-    )
+    result = asyncio.run(pipeline.retrieve_context("query", make_context()))
 
-    assert len(cache.store) == 2
-    keys = sorted(cache.store.keys())
-    assert "rewrite A" in keys[0]
-    assert "rewrite B" in keys[1]
+    assert result.status == RetrieveStatus.RETRIEVED
+    assert [doc["id"] for doc in result.docs] == ["1"]
+    assert cache.store

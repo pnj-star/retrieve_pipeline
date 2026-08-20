@@ -1,10 +1,10 @@
-"""基于 common_core provider 的可执行检索与回答管线。
+"""基于 common_core provider 的可执行检索管线。
 
-RagPipeline 串联整个 RAG 执行流程：
-  响应缓存检查 → 查询改写（默认 off）→ 混合检索（稀疏 + 稠密）
-  → RRF 融合 → 交叉编码器精排
-  → 相关性阈值判断 → 拼上下文 → 生成 → 质量护栏 → 回写缓存
-并在过程中上报各环节的耗时与错误指标。
+RagPipeline 串联整个 RAG 检索流程：
+  检索缓存检查 → 查询改写（默认 off）→ 混合检索（稀疏 + 稠密）
+  → RRF 融合 → 交叉编码器精排 → 相关性阈值判断 → 回写检索缓存
+并在过程中上报各环节的耗时与错误指标。回答生成与护栏归属 agent 编排层，
+``common_core.rag`` 提供答案侧公共机制供其复用。
 """
 
 from __future__ import annotations
@@ -20,24 +20,16 @@ from common_core.instrumentation import trace_node
 from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 from common_core.providers.vector import build_filter_expr
-from common_core.telemetry import trace_id
+from common_core.rag.assembly import DEFAULT_MAX_CONTEXT_CHARS, build_context_text, clean_markdown
 
-from .results import RagResult, RagStatus
+from .results import RetrieveResult, RetrieveStatus
 from .stages import (
-    GenerationConfig,
-    GuardConfig,
     QueryRewriteResult,
     QueryRewriter,
     Reranker,
-    ResponseCache,
-    build_context_text,
-    clean_markdown,
-    generate_answer,
-    guard_generation,
+    RetrievalCache,
     judge_relevance,
 )
-from .stages.assembly import DEFAULT_MAX_CONTEXT_CHARS
-from .stages.generation import DEFAULT_PROMPT_TEMPLATE
 from .tokenization import build_token_counter
 
 logger = logging.getLogger(__name__)
@@ -202,8 +194,8 @@ class RagPipeline:
       - llm: OpenAI 兼容 LLM
       - vector: Milvus 向量库（混合检索）
       - embedder: 本地 Embedding 模型
-      - cache: Redis 底层缓存（服务于响应缓存）
-      - reranker / response_cache / guard_config: 可选的重排、缓存与护栏阶段
+      - cache: Redis 底层缓存（服务于检索缓存）
+      - reranker / retrieval_cache: 可选的重排与检索缓存阶段
     """
 
     def __init__(
@@ -216,8 +208,7 @@ class RagPipeline:
         cache: RedisCache | None = None,
         metrics: Observability | None = None,
         reranker: Reranker | None = None,
-        response_cache: ResponseCache | None = None,
-        guard_config: GuardConfig | None = None,
+        retrieval_cache: RetrievalCache | None = None,
         query_rewriter: QueryRewriter | None = None,
         min_relevance: float | None = None,
         tenant_filter: bool = True,
@@ -234,8 +225,7 @@ class RagPipeline:
             cache: Redis 底层缓存实例（供响应缓存复用连接）；未传则默认构建。
             metrics: 可观测性 / 指标上报对象；为 None 则不上报指标。
             reranker: 交叉编码器精排器；None 表示不启用精排。
-            response_cache: 响应缓存实例；None 表示不启用响应缓存。
-            guard_config: 质量护栏配置；None 表示默认无护栏配置。
+            retrieval_cache: 检索结果缓存实例（query → 精排后文档）；None 表示不启用。
             query_rewriter: 查询改写器；None 则用默认 QueryRewriter。
             min_relevance: 精排后的最低相关性阈值；None 时用 runtime 默认值。
             tenant_filter: 是否强制按 tenant_id/kb_id 做隔离过滤，默认 True。
@@ -252,15 +242,13 @@ class RagPipeline:
         self.embedder = embedder or LocalEmbedder(config=self.runtime.llm)
         self.cache = cache or RedisCache(self.runtime.cache)
         self.reranker = reranker
-        self.response_cache = response_cache
-        # 响应缓存若未显式传入指标对象，则复用管线的全局指标，保证缓存指标统一上报。
+        self.retrieval_cache = retrieval_cache
         if (
-            self.response_cache is not None
-            and getattr(self.response_cache, "metrics", None) is None
+            self.retrieval_cache is not None
+            and getattr(self.retrieval_cache, "metrics", None) is None
             and metrics is not None
         ):
-            self.response_cache.metrics = metrics
-        self.guard_config = guard_config
+            self.retrieval_cache.metrics = metrics
         self.query_rewriter = query_rewriter or QueryRewriter(
             self.llm,
             self.runtime.query_rewrite,
@@ -377,8 +365,8 @@ class RagPipeline:
 
         - 显式传入了 ``rewrite_query`` 时直接采用它，跳过 LLM；
         - 否则按配置的改写策略执行一次查询改写。
-        该方法被 ``retrieve()`` 和 ``_answer_impl()`` 共用，保证整条管线
-        在同一处统一处理改写，避免两处逻辑分叉。
+        该方法被 ``retrieve()`` 统一调用，保证整条管线在同一处集中处理改写，
+        避免检索侧与潜在调用方出现逻辑分叉。
 
         参数:
             query: 原始用户查询文本。
@@ -589,192 +577,120 @@ class RagPipeline:
             )
         return docs
 
-    async def answer(
-        self,
-        query: str,
-        context: AgentContext | None = None,
-        *,
-        collection_name: str | None = None,
-        system_prompt: str = "",
-        top_k: int | None = None,
-        output_fields: Iterable[str] | None = None,
-        filter_expr: str | None = None,
-        query_rewrite_mode: str | None = None,
-        rewrite_query: str | None = None,
-        empty_answer: str = "No relevant context found.",
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        min_relevance: float | None = None,
-        guard_config: GuardConfig | None = None,
-        enable_guard: bool = True,
-        prompt_template: str | None = None,
-        context_max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
-        context_max_tokens: int | None = None,
-        count_tokens: Callable[[str], int] | None = None,
-        max_doc_chars: int | None = None,
-        max_doc_tokens: int | None = None,
-    ) -> RagResult:
-        """完整执行一次的 RAG 回答；对异常做兜底，绝不向上抛错。
-
-        任何内部异常都会被转换为 ``status=error`` 的 RagResult，并记录日志与
-        指标，保证调用方（如 MCP 层）始终拿到稳定的返回契约。
-
-        参数:
-            query: 用户的问题文本。
-            context: agent 上下文；可为 None。
-            system_prompt: 附加在生成 prompt 里的系统指令，追加在模板之后。
-            top_k: 检索候选条数；None 用默认值。
-            output_fields: 检索返回字段覆盖；None 用管线默认。
-            filter_expr: 额外业务过滤表达式。
-            query_rewrite_mode: 改写模式；None 按配置决定。
-            rewrite_query: 显式改写后的查询；非空时跳过内置改写。
-            collection_name: 覆盖默认的 Milvus 集合名；None 用 runtime 配置。
-            empty_answer: 无可用上下文时返回的占位回答文案。
-            temperature: LLM 采样温度；None 用模型/配置默认。
-            max_tokens: 生成最大 token 数；None 用模型/配置默认。
-            min_relevance: 本次最低相关性阈值覆盖；None 用管线默认。
-            guard_config: 本次护栏配置覆盖；None 用管线默认。
-            enable_guard: 是否启用护栏阶段，默认 True。
-            prompt_template: 覆盖默认生成 prompt 模板。
-            context_max_chars: 上下文最大字符数。
-            context_max_tokens: 上下文最大 token 数（需 count_tokens 支持）。
-            count_tokens: 字符串转 token 数函数。
-            max_doc_chars: 单篇文档最大字符数。
-            max_doc_tokens: 单篇文档最大 token 数。
-
-        返回:
-            包含状态、回答、候选文档与改写信息的 RagResult。
-        """
-        tenant_id, kb_id, request_id, session_id = self._context_labels(context)
-        if self.metrics is not None:
-            self.metrics.begin_run()
-        start = time.perf_counter()
-        try:
-            result = await self._answer_impl(
-                query,
-                context,
-                collection_name=collection_name,
-                system_prompt=system_prompt,
-                top_k=top_k,
-                output_fields=output_fields,
-                filter_expr=filter_expr,
-                query_rewrite_mode=query_rewrite_mode,
-                rewrite_query=rewrite_query,
-                empty_answer=empty_answer,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                min_relevance=min_relevance,
-                guard_config=guard_config,
-                enable_guard=enable_guard,
-                prompt_template=prompt_template,
-                context_max_chars=context_max_chars,
-                context_max_tokens=context_max_tokens,
-                count_tokens=count_tokens,
-                max_doc_chars=max_doc_chars,
-                max_doc_tokens=max_doc_tokens,
-            )
-        except Exception as exc:
-            self._observe_error("answer", context)
-            logger.exception(
-                "rag.answer.error tenant_id=%s kb_id=%s request_id=%s session_id=%s",
-                tenant_id,
-                kb_id,
-                request_id,
-                session_id,
-            )
-            result = RagResult(RagStatus.ERROR, str(exc), [], "")
-            result.rewritten_query = rewrite_query or query
-        self._observe("answer", start, context)
-        if self.metrics is not None:
-            self.metrics.end_run(
-                route=result.status,
-                tenant_id=tenant_id,
-                kb_id=kb_id,
-            )
-        logger.info(
-            "rag.answer.end status=%s tenant_id=%s kb_id=%s request_id=%s session_id=%s",
-            result.status,
-            tenant_id,
-            kb_id,
-            request_id,
-            session_id,
-        )
-        return result
-
-    async def _answer_impl(
+    def _build_rewrite_cache_key(
         self,
         query: str,
         context: AgentContext | None,
         *,
-        collection_name: str | None,
-        system_prompt: str,
-        top_k: int | None,
-        output_fields: Iterable[str] | None,
-        filter_expr: str | None,
         query_rewrite_mode: str | None,
         rewrite_query: str | None,
-        empty_answer: str,
-        temperature: float | None,
-        max_tokens: int | None,
-        min_relevance: float | None,
-        guard_config: GuardConfig | None,
-        enable_guard: bool,
-        prompt_template: str | None,
-        context_max_chars: int,
-        context_max_tokens: int | None,
-        count_tokens: Callable[[str], int] | None,
-        max_doc_chars: int | None,
-        max_doc_tokens: int | None,
-    ) -> RagResult:
-        """RAG 核心流水线（不含 answer 的异常兜底包装）。
+    ) -> str:
+        """构造检索缓存 key：基于原始查询 + 改写模式分桶。
 
-        参数语义与 ``answer()`` 完全一致，全部为关键字参数，唯一的区别是：
-        这里不做异常兜底，内部异常会直接向上抛出，由外层 ``answer()``
-        统一转换成 ``status=error`` 的稳定返回。
+        缓存命中时跳过改写，因此 key 必须在改写运行前就能计算出来，不能依赖
+        改写后的文本（除非调用方显式传入 rewrite_query，那种情况直接以其为 key）。
         """
-        tenant_id, kb_id, request_id, session_id = self._context_labels(context)
-        logger.info(
-            "rag.answer.start tenant_id=%s kb_id=%s request_id=%s session_id=%s trace_id=%s",
-            tenant_id,
-            kb_id,
-            request_id,
-            session_id,
-            trace_id(),
-        )
-
-        # 第一步：先构造缓存 key（不预跑改写），命中即返回，避免缓存命中时也调用改写模型。
         effective_mode = self.query_rewriter.resolve_mode(
             context,
             requested_mode=query_rewrite_mode,
         )
-        cache_key = self._cache_query_key(
+        return self._cache_query_key(
             query,
             mode=effective_mode,
             rewrite_query=rewrite_query,
         )
 
-        # 第二步：检查响应缓存（按租户隔离）。命中则不再走任何 provider。
-        if self.response_cache is not None:
-            cached = self.response_cache.get(cache_key, context=context)
-            if cached is not None:
-                return RagResult(
-                    RagStatus.ANSWERED_CACHE,
-                    "answered from cache",
-                    [],
-                    cached,
-                    rewritten_query=rewrite_query or query,
+    async def _rerank_docs(
+        self,
+        docs: list[dict[str, Any]],
+        query: str,
+        context: AgentContext | None,
+        *,
+        tenant_id: str,
+        kb_id: str,
+        request_id: str,
+    ) -> list[dict[str, Any]]:
+        """对混合检索结果做交叉编码器精排；未配置重排器则原样透传。"""
+        if self.reranker is None:
+            return docs
+        start_rerank = time.perf_counter()
+        try:
+            with trace_node(
+                "rerank",
+                tenant_id=tenant_id,
+                kb_id=kb_id,
+                request_id=request_id,
+            ):
+                ranked = await self.reranker.arank(
+                    query,
+                    docs,
+                    tenant_id=tenant_id,
+                    kb_id=kb_id,
                 )
+        except Exception:
+            self._observe_error("rerank", context)
+            raise
+        finally:
+            self._observe("rerank", start_rerank, context)
+        return list(ranked or [])
 
-        # 第三步：缓存未命中，才执行一次改写。
-        rewrite_result = await self._resolve_rewrite(
+    async def retrieve_context(
+        self,
+        query: str,
+        context: AgentContext | None = None,
+        *,
+        collection_name: str | None = None,
+        top_k: int | None = None,
+        output_fields: Iterable[str] | None = None,
+        filter_expr: str | None = None,
+        query_rewrite_mode: str | None = None,
+        rewrite_query: str | None = None,
+        min_relevance: float | None = None,
+    ) -> RetrieveResult:
+        """执行完整的"检索 → 精排 → 阈值"管道，并做检索缓存（query → 达标文档）。
+
+        流程与企业检索标准一致：
+        1. 先查检索缓存（key = 原始查询 + 改写模式分桶，按 tenant/kb 隔离）。
+           命中 → 直接返回缓存的精排后文档（status=retrieved_cache）。
+        2. 未命中 → 查询改写（off/identity/llm_rewrite/query_expansion）。
+        3. 混合检索（稀疏 + 稠密）：两者都空 → status=no_context。
+        4. 至少一方有结果 → RRF 融合 → top_k。
+        5. 交叉编码器精排，与相关性阈值比较：全部低于阈值 → status=no_context。
+        6. 有达标文档 → 回写检索缓存 → status=retrieved。
+
+        参数:
+            query: 用户查询文本。
+            context: agent 上下文；可为 None（表示无租户隔离）。
+            collection_name/top_k/output_fields/filter_expr/query_rewrite_mode/
+                rewrite_query: 语义与 ``retrieve()`` 一致。
+            min_relevance: 本次精排相关性阈值覆盖；None 用管线默认。
+
+        返回:
+            ``RetrieveResult``：docs 始终携带检索/精排后的候选文档，
+            是否达到阈值由 status 表达。
+        """
+        tenant_id, kb_id, request_id, _session_id = self._context_labels(context)
+        cache_key = self._build_rewrite_cache_key(
             query,
             context,
             query_rewrite_mode=query_rewrite_mode,
             rewrite_query=rewrite_query,
         )
-        rewritten_query = rewrite_result.rewritten_query or query
 
-        # 第四步：混合检索（复用已解析的改写结果，避免二次改写）
+        # 第一步：先查检索缓存；命中则跳过改写、混合检索与精排。
+        if self.retrieval_cache is not None:
+            cached = self.retrieval_cache.get(cache_key, context=context)
+            if cached is not None:
+                return RetrieveResult(
+                    RetrieveStatus.RETRIEVED_CACHE,
+                    docs=cached,
+                    rewritten_query=rewrite_query or query,
+                    cache_hit=True,
+                    message="retrieved from cache",
+                )
+
+        # 第二步：缓存未命中 → 查询改写 + 混合检索 + RRF + top_k。
+        rewrite_trace: dict[str, Any] = {}
         docs = await self.retrieve(
             query,
             context,
@@ -784,157 +700,52 @@ class RagPipeline:
             filter_expr=filter_expr,
             query_rewrite_mode=query_rewrite_mode,
             rewrite_query=rewrite_query,
-            _resolved_rewrite=rewrite_result,
+            rewrite_trace=rewrite_trace,
         )
+        rewritten_query = rewrite_trace.get("rewritten_query") or query
+
+        # 第三步：混合检索两边都空 → 没有可用上下文。
         if not docs:
-            # 检索为空：没有可用上下文
-            return RagResult(
-                RagStatus.NO_CONTEXT,
-                empty_answer,
-                [],
-                empty_answer,
+            return RetrieveResult(
+                RetrieveStatus.NO_CONTEXT,
+                docs=[],
                 rewritten_query=rewritten_query,
+                message="no context",
             )
 
-        # 第五步：交叉编码器精排（若配置了重排器）
-        ranked = docs
-        if self.reranker is not None:
-            start_rerank = time.perf_counter()
-            try:
-                with trace_node(
-                    "rerank",
-                    tenant_id=tenant_id,
-                    kb_id=kb_id,
-                    request_id=request_id,
-                ):
-                    ranked = await self.reranker.arank(
-                        rewritten_query,
-                        docs,
-                        tenant_id=tenant_id,
-                        kb_id=kb_id,
-                    )
-            except Exception:
-                self._observe_error("rerank", context)
-                raise
-            finally:
-                self._observe("rerank", start_rerank, context)
-            ranked = list(ranked or [])
+        # 第四步：交叉编码器精排。
+        ranked = await self._rerank_docs(
+            docs,
+            rewritten_query,
+            context,
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            request_id=request_id,
+        )
 
-        # 第六步：相关性阈值判断。低于阈值视为没有可用上下文，
-        # 但候选文档（ranked）会随结果返回，便于外层 agent 决定是否转人工。
+        # 第五步：相关性阈值判断与达标文档筛选。
         threshold = min_relevance if min_relevance is not None else self.min_relevance
-        if self.reranker is not None and judge_relevance(ranked, threshold):
-            return RagResult(
-                RagStatus.NO_CONTEXT,
-                empty_answer,
-                ranked,
-                empty_answer,
-                rewritten_query=rewritten_query,
-            )
-
-        # 第七步：把精排后的文档拼成给 LLM 的上下文文本（去重、清 markdown、截断）
-        max_chars = (
-            DEFAULT_MAX_CONTEXT_CHARS
-            if context_max_chars is None
-            else context_max_chars
-        )
-        token_counter = count_tokens if count_tokens is not None else self.count_tokens
-        if context_max_tokens is not None and token_counter is None:
-            logger.warning(
-                "rag.answer.token_budget_without_counter tenant_id=%s kb_id=%s "
-                "request_id=%s; falling back to char budget",
-                tenant_id,
-                kb_id,
-                request_id,
-            )
-            context_max_tokens = None
-        context_text, _sources = build_context_text(
-            ranked,
-            max_chars=max_chars,
-            max_tokens=context_max_tokens,
-            count_tokens=token_counter,
-            max_doc_chars=max_doc_chars,
-            max_doc_tokens=max_doc_tokens,
-            format_doc=_format_doc,
-        )
-        # 第八步：选择生成 / 护栏节点
-        cfg = guard_config if guard_config is not None else self.guard_config
-        node_name = "guard" if (enable_guard and cfg is not None) else "generate"
-
-        async def _generate(q: str, ctx_text: str, guard_reason: str) -> str:
-            """真正调用 LLM 生成回答；护栏重试时会回传上次未通过的原因。
-
-            参数:
-                q: 要回答的用户查询。
-                ctx_text: 已拼好的上下文文本。
-                guard_reason: 上一次护栏未通过的原因；为空表示首次生成。
-
-            返回:
-                LLM 生成的回答字符串。
-            """
-            instructions = system_prompt.strip()
-            if guard_reason:
-                instructions = (
-                    f"{instructions}\n\n{guard_reason}".strip()
-                    if instructions
-                    else guard_reason
+        if self.reranker is not None:
+            if judge_relevance(ranked, threshold):
+                # 没有任何文档达标 → no_context，但仍返回全部候选供 agent 判断是否转人工。
+                return RetrieveResult(
+                    RetrieveStatus.NO_CONTEXT,
+                    docs=ranked,
+                    rewritten_query=rewritten_query,
+                    message="no relevant docs above threshold",
                 )
-            return await generate_answer(
-                self.llm,
-                q,
-                context_text=ctx_text,
-                config=GenerationConfig(
-                    prompt_template=prompt_template or DEFAULT_PROMPT_TEMPLATE,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                ),
-                extra_prompt=instructions,
-                # 生成失败视为硬错误，交由上层 answer 兜底为 status=error
-                raise_on_error=True,
-            )
+            # 只保留达标文档：交给 agent 并写入缓存（缓存价值 = 精排后达标文档）。
+            ranked = [
+                doc for doc in ranked
+                if float(doc.get("ce_score", 0.0)) >= threshold
+            ]
 
-        start_generate = time.perf_counter()
-        try:
-            if node_name == "guard":
-                # 走护栏：生成 + LLM 评审 + 按需重试
-                response, guard_result, _attempts = await guard_generation(
-                    self.llm,
-                    generate=_generate,
-                    query=query,
-                    context_text=context_text,
-                    config=cfg,
-                )
-                if self.metrics is not None:
-                    self.metrics.record_guard(
-                        "pass" if guard_result.passed else "fail_exhausted",
-                        tenant_id=tenant_id,
-                        kb_id=kb_id,
-                    )
-                if not guard_result.passed:
-                    # 护栏不通过：拦截结果，同时返回候选文档与（未过审的）回答
-                    return RagResult(
-                        RagStatus.GUARD_BLOCKED,
-                        guard_result.reason or "guard_blocked",
-                        ranked,
-                        response,
-                        rewritten_query=rewritten_query,
-                    )
-            else:
-                # 未启用护栏：直接生成
-                response = await _generate(query, context_text, "")
-        except Exception:
-            self._observe_error(node_name, context)
-            raise
-        finally:
-            self._observe(node_name, start_generate, context)
-
-        # 第七步：把结果写回响应缓存（仅成功回答会被缓存）
-        if self.response_cache is not None:
-            self.response_cache.put(cache_key, response, context=context)
-        return RagResult(
-            RagStatus.ANSWERED,
-            "ok",
-            ranked,
-            response,
+        # 第六步：有达标文档 → 回写检索缓存（命中即复用精排结果）。
+        if self.retrieval_cache is not None:
+            self.retrieval_cache.put(cache_key, ranked, context=context)
+        return RetrieveResult(
+            RetrieveStatus.RETRIEVED,
+            docs=ranked,
             rewritten_query=rewritten_query,
+            message="ok",
         )

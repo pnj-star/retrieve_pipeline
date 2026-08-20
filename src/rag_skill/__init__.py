@@ -1,68 +1,39 @@
-"""基于 common_core provider 的可复用 RAG 管线技能包。
+"""基于 common_core provider 的可复用 RAG 检索技能包。
 
 对外统一导出：组装函数（build_runtime / build_pipeline）、管线（RagPipeline）、
-返回契约（RagResult / RagStatus）、MCP 入口（create_mcp_server / main），
-以及各阶段函数（重排、上下文组装、生成、护栏、缓存）。
+检索结果契约（RetrieveResult / RetrieveStatus）、MCP 入口
+（create_mcp_server / main），以及检索侧阶段（重排、查询改写、检索缓存）。
+
+回答侧的上下文组装 / 生成 / 护栏位于 ``common_core.rag``，
+供 rag_skill 之外的 agent / 多 agent 框架复用。
 """
 
 from .builder import build_pipeline, build_runtime
 from .mcp import create_mcp_server, main
 from .pipeline import RagPipeline
-from .results import RagResult, RagStatus
+from .results import RetrieveResult, RetrieveStatus
 from .stages import (
-    DEFAULT_ABSOLUTE_WORDS,
-    GenerationConfig,
-    GuardConfig,
-    GuardResult,
     Reranker,
-    ResponseCache,
-    absolute_language_issues,
-    build_context_text,
-    check_compound_numbers,
-    clean_markdown,
-    dedupe_docs,
-    evaluate_guard,
-    extract_all_numbers,
-    extract_images,
-    extract_risky_numbers,
-    generate_answer,
-    guard_generation,
+    RetrievalCache,
     judge_relevance,
     rank_docs,
-    stream_answer,
 )
 from .tokenization import build_token_counter, make_token_counter
 
 __all__ = [
-    "DEFAULT_ABSOLUTE_WORDS",
-    "GenerationConfig",
-    "GuardConfig",
-    "GuardResult",
     "RagPipeline",
-    "RagResult",
-    "RagStatus",
     "Reranker",
-    "ResponseCache",
-    "absolute_language_issues",
-    "build_context_text",
+    "RetrievalCache",
+    "RetrieveResult",
+    "RetrieveStatus",
     "build_pipeline",
     "build_runtime",
     "build_token_counter",
-    "check_compound_numbers",
-    "clean_markdown",
     "create_mcp_server",
-    "dedupe_docs",
-    "evaluate_guard",
-    "extract_all_numbers",
-    "extract_images",
-    "extract_risky_numbers",
-    "generate_answer",
-    "guard_generation",
     "judge_relevance",
     "main",
     "make_token_counter",
     "rank_docs",
-    "stream_answer",
 ]
 
 __version__ = "0.1.0"

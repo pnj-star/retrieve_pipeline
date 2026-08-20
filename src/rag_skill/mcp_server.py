@@ -1,4 +1,4 @@
-"""构建暴露 rag_retrieve / rag_answer 的 FastMCP 服务器。
+"""构建只暴露 rag_retrieve 的 FastMCP 服务器。
 
 把 MCP 服务器（工具 + 鉴权 + trace 接线）与命令行入口拆开：本模块等价于
 参考工程里的 ``tools_server.py``，只负责 ``create_mcp_server()``；入口
@@ -14,9 +14,14 @@ from common_core import telemetry
 from common_core.auth import AuthConfig
 from common_core.instrumentation import current_trace_id, trace_node
 from common_core.mcp_auth import ToolContextGuard, build_mcp_auth
+from common_core.rag.assembly import (
+    DEFAULT_MAX_CONTEXT_CHARS,
+    build_context_text,
+    clean_markdown,
+)
 
 from .pipeline import RagPipeline
-from .results import RagResult, RagStatus
+from .results import RetrieveStatus
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,22 @@ def _attach_trace(traceparent: str | None):
     return telemetry.set_current_context(telemetry.parse_traceparent(traceparent))
 
 
+def _format_doc(index: int, doc: dict[str, Any]) -> str:
+    """把单篇检索文档渲染成一行上下文片段（供 build_context_text 使用）。"""
+    content = str(doc.get("parent_content", "") or doc.get("content", "") or "")
+    fields = {
+        "content": clean_markdown(content) if content.strip() else None,
+        "source": doc.get("source"),
+        "category": doc.get("category"),
+        "score": doc.get("score"),
+    }
+    parts = [f"[{index}]"]
+    for field_name, value in fields.items():
+        if value is not None and str(value).strip():
+            parts.append(f"{field_name}: {value}")
+    return " | ".join(parts)
+
+
 def create_mcp_server(
     pipeline: RagPipeline | None = None,
     *,
@@ -79,16 +100,16 @@ def create_mcp_server(
     log_level: str = "INFO",
     debug: bool = False,
     instructions: str = (
-        "Tenant-scoped RAG tools. Every call must pass tenant_id, kb_id, and "
-        "request_id; when AUTH_MODE=jwt, also pass a JWT auth_token whose "
-        "tenant_id and kb_id claims match the requested scope. rag_answer "
-        "returns status (answered|answered_cache|no_context|guard_blocked|error), "
-        "message, docs, and answer. Optional: pass an upstream W3C traceparent "
-        "header to keep the distributed trace linked; the response includes a "
-        "trace_id for correlation in logs and tracing backends."
+        "Tenant-scoped RAG retrieval tool. Every call must pass tenant_id, kb_id, "
+        "and request_id; when AUTH_MODE=jwt, also pass a JWT auth_token whose "
+        "tenant_id and kb_id claims match the requested scope. rag_retrieve only "
+        "returns raw docs plus a budgeted context_text, and never generates an "
+        "answer. Optional: pass an upstream W3C traceparent header to keep the "
+        "distributed trace linked; the response includes a trace_id for "
+        "correlation in logs and tracing backends."
     ),
 ) -> Any:
-    """构建暴露 rag_retrieve / rag_answer 的 FastMCP 服务器。"""
+    """构建只暴露 rag_retrieve 的 FastMCP 服务器。"""
     from mcp.server.fastmcp import FastMCP
 
     pipeline = _load_pipeline(pipeline)
@@ -126,8 +147,20 @@ def create_mcp_server(
         filter_expr: str | None = None,
         query_rewrite_mode: str | None = None,
         rewrite_query: str | None = None,
+        min_relevance: float | None = None,
+        context_max_chars: int | None = None,
+        context_max_tokens: int | None = None,
+        max_doc_chars: int | None = None,
+        max_doc_tokens: int | None = None,
     ) -> dict[str, Any]:
-        """只检索租户范围内的文档，不生成回答。"""
+        """只检索租户范围内的文档，不生成回答。
+
+        走完整检索管道：检索缓存命中（query → 精排后达标文档）直接返回；
+        未命中则查询改写 → 混合检索（稀疏+稠密）→ RRF → 精排 → 阈值筛选，
+        达标文档回写检索缓存。返回原始 ``docs`` 供 agent 做多来源融合 / 复核，
+        同时用共享的 ``build_context_text`` 产出一段受预算约束、可直接喂给 LLM
+        的 ``context_text``，避免 top-k 文档把 agent 的上下文窗口打爆。不做回答生成。
+        """
         context = guard.resolve(
             tenant_id=tenant_id,
             kb_id=kb_id,
@@ -138,7 +171,6 @@ def create_mcp_server(
         )
         trace_token = _attach_trace(traceparent)
         trace_id_value: str | None = None
-        rewrite_trace: dict[str, Any] = {}
         try:
             with trace_node(
                 "rag_retrieve",
@@ -147,7 +179,7 @@ def create_mcp_server(
                 request_id=context.request_id,
             ):
                 trace_id_value = current_trace_id()
-                docs = await pipeline.retrieve(
+                result = await pipeline.retrieve_context(
                     query,
                     context,
                     collection_name=collection_name,
@@ -155,111 +187,39 @@ def create_mcp_server(
                     filter_expr=filter_expr,
                     query_rewrite_mode=query_rewrite_mode,
                     rewrite_query=rewrite_query,
-                    rewrite_trace=rewrite_trace,
+                    min_relevance=min_relevance,
                 )
         finally:
             telemetry.reset_context(trace_token)
+        docs = result.docs
+        if docs:
+            context_text, _sources = build_context_text(
+                docs,
+                max_chars=(
+                    DEFAULT_MAX_CONTEXT_CHARS
+                    if context_max_chars is None
+                    else context_max_chars
+                ),
+                max_tokens=context_max_tokens,
+                max_doc_chars=max_doc_chars,
+                max_doc_tokens=max_doc_tokens,
+                format_doc=_format_doc,
+            )
+        else:
+            context_text = ""
         return {
-            "ok": True,
-            "status": "no_context" if not docs else "retrieved",
+            "ok": result.status != RetrieveStatus.ERROR,
+            "status": result.status,
+            "message": result.message,
+            "cache_hit": result.cache_hit,
             "tenant_id": context.tenant_id,
             "kb_id": context.kb_id,
             "request_id": context.request_id,
             "user_id": context.user_id,
             "count": len(docs),
             "docs": docs,
-            "rewritten_query": rewrite_trace.get("rewritten_query", "") or query,
-            "trace_id": trace_id_value,
-        }
-
-    @server.tool()
-    async def rag_answer(
-        query: str,
-        tenant_id: str,
-        kb_id: str,
-        request_id: str,
-        auth_token: str | None = None,
-        traceparent: str | None = None,
-        session_id: str = "",
-        user_id: str = "",
-        collection_name: str | None = None,
-        system_prompt: str = "",
-        top_k: int | None = None,
-        empty_answer: str = "No relevant context found.",
-        filter_expr: str | None = None,
-        min_relevance: float | None = None,
-        enable_guard: bool = True,
-        prompt_template: str | None = None,
-        context_max_chars: int | None = None,
-        context_max_tokens: int | None = None,
-        max_doc_chars: int | None = None,
-        max_doc_tokens: int | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        query_rewrite_mode: str | None = None,
-        rewrite_query: str | None = None,
-    ) -> dict[str, Any]:
-        """检索、重排并生成回答（走完整 RAG 管线）。"""
-        context = guard.resolve(
-            tenant_id=tenant_id,
-            kb_id=kb_id,
-            request_id=request_id,
-            session_id=session_id,
-            user_id=user_id,
-            auth_token=auth_token,
-        )
-        trace_token = _attach_trace(traceparent)
-        trace_id_value: str | None = None
-        try:
-            with trace_node(
-                "rag_answer",
-                tenant_id=context.tenant_id,
-                kb_id=context.kb_id,
-                request_id=context.request_id,
-            ):
-                trace_id_value = current_trace_id()
-                result = await pipeline.answer(
-                    query,
-                    context,
-                    collection_name=collection_name,
-                    system_prompt=system_prompt,
-                    top_k=top_k,
-                    empty_answer=empty_answer,
-                    filter_expr=filter_expr,
-                    min_relevance=min_relevance,
-                    enable_guard=enable_guard,
-                    prompt_template=prompt_template,
-                    context_max_chars=context_max_chars,
-                    context_max_tokens=context_max_tokens,
-                    max_doc_chars=max_doc_chars,
-                    max_doc_tokens=max_doc_tokens,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    query_rewrite_mode=query_rewrite_mode,
-                    rewrite_query=rewrite_query,
-                )
-                if isinstance(result, str):
-                    result = RagResult(
-                        RagStatus.ANSWERED,
-                        "",
-                        [],
-                        result,
-                        rewritten_query=rewrite_query or query,
-                    )
-        finally:
-            telemetry.reset_context(trace_token)
-        return {
-            "ok": result.ok,
-            "status": result.status,
-            "message": result.message,
-            "docs": result.docs,
-            "count": len(result.docs),
-            "answer": result.answer,
-            "tenant_id": context.tenant_id,
-            "kb_id": context.kb_id,
-            "request_id": context.request_id,
-            "user_id": context.user_id,
-            "rewritten_query": getattr(result, "rewritten_query", "") or query,
+            "context_text": context_text,
+            "rewritten_query": result.rewritten_query or query,
             "trace_id": trace_id_value,
         }
 

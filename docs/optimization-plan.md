@@ -3,6 +3,11 @@
 > 版本：v1.0　日期：2026-08-18　状态：待评审
 > 适用范围：`common_core`（基础能力）+ `rag_skill`（查询侧 RAG）+ 未来 `knowledge_ingest_skill` / `eval_skill` + `instances/merchant`（首个消费实例）
 
+> 当前状态说明：本计划为历史文档。`rag_skill` 现已收敛为检索专用，
+> MCP 只暴露 `rag_retrieve`；回答侧机制（上下文组装、生成、护栏）已下沉到
+> `common_core.rag`，供 agent / 多 agent 框架复用。文中涉及 `rag_answer` /
+> 嵌在 skill 内的生成、护栏部分视为已废除，请以 `SKILL.md` 与 `common_core.rag` 为准。
+
 ---
 
 ## 一、现状评估（已对代码逐行核实）

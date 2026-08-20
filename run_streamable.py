@@ -20,7 +20,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent
     for src_dir in (
         root / "src",
-        root / "common_core" / "src",
+        root.parent / "common_core" / "src",
     ):
         if src_dir.exists() and str(src_dir) not in sys.path:
             sys.path.insert(0, str(src_dir))

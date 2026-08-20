@@ -1,4 +1,4 @@
-"""从环境变量（或显式传入参数）组装 runtime、provider、cache、reranker、guard 等实例。
+"""从环境变量（或显式传入参数）组装 runtime、provider、cache、reranker 等实例。
 
 本模块是整个 rag_skill 的装配层：把 common_core 提供的通用能力
 （LLM、向量库、Embedding、Redis 缓存）与 rag_skill 自己的阶段
@@ -14,7 +14,7 @@ from common_core.config import RuntimeConfig, load_env_files
 from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 
-from .stages import Reranker, ResponseCache
+from .stages import Reranker, RetrievalCache
 from .tokenization import build_token_counter
 
 
@@ -145,30 +145,35 @@ def build_reranker(
     )
 
 
-def build_response_cache(
+def build_retrieval_cache(
     runtime: RuntimeConfig | None = None,
     *,
     cache: RedisCache | None = None,
     metrics: Observability | None = None,
     **overrides: Any,
-) -> ResponseCache:
-    """构建租户隔离的响应缓存，复用底层 Redis 缓存连接。
+) -> RetrievalCache:
+    """构建租户隔离的检索缓存（query → 精排后达标文档），复用底层 Redis 连接。
+
+    检索缓存（``rag_retrieval``）只负责检索侧：命中时直接复用精排后文档，
+    跳过改写、混合检索与精排。
 
     参数:
         runtime: 运行时配置；None 时从环境构建。
         cache: 底层 Redis 缓存实例；None 时用 build_cache(runtime) 构建。
         metrics: 可观测性 / 指标对象；可为 None。
-        overrides: 透传给 ResponseCache 构造器的额外参数。
+        overrides: 透传给 RetrievalCache 构造器的额外参数。
 
     返回:
-        配置好的 ResponseCache 实例。
+        配置好的 RetrievalCache 实例。
     """
     runtime = runtime or build_runtime()
-    return ResponseCache(
+    return RetrievalCache(
         cache or build_cache(runtime),
         metrics=metrics,
         **overrides,
     )
+
+
 def build_pipeline(
     runtime: RuntimeConfig | None = None,
     *,
@@ -178,11 +183,8 @@ def build_pipeline(
 ) -> Any:
     """组装完整的 RagPipeline。
 
-    - include_defaults=True 时自动注入响应缓存、重排器与 token 计数；
+    - include_defaults=True 时自动注入检索缓存、重排器与 token 计数；
       测试场景可传 False 跳过这些阶段（置为 None）。
-    - guard 默认关闭（guard_config=None）：护栏每轮回答都要多做一次 LLM 评审并可重试，
-      对多 agent 工具场景延迟与成本偏高，故默认不注入；需要时传入
-      ``guard_config=GuardConfig()`` 或调用时传 ``enable_guard=True``。
     - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker、count_tokens 等 RagPipeline 参数）；
     - count_tokens 推荐使用 ``build_token_counter()``：tiktoken 可用时按真实 token 计数，
       不可用时回退为字符数。
@@ -190,7 +192,7 @@ def build_pipeline(
     参数:
         runtime: 运行时配置；None 时从环境构建。
         metrics: 可观测性 / 指标对象；可为 None。
-        include_defaults: 是否自动注入响应缓存、重排器与 token 计数；
+        include_defaults: 是否自动注入检索缓存、重排器与 token 计数；
             测试场景可传 False 跳过这些阶段（对应组件置为 None）。
         overrides: 透传给 RagPipeline 构造器的参数；与默认注入的组件冲突时以显式传入为准。
 
@@ -201,13 +203,12 @@ def build_pipeline(
 
     kwargs = dict(overrides)
     if include_defaults:
-        default_response_cache = build_response_cache(runtime, metrics=metrics)
+        default_cache = build_cache(runtime)
+        kwargs.setdefault("cache", default_cache)
         kwargs.setdefault(
-            "response_cache",
-            default_response_cache,
+            "retrieval_cache",
+            build_retrieval_cache(runtime, cache=default_cache, metrics=metrics),
         )
-        # 底层 Redis 缓存与响应缓存共用同一连接
-        kwargs.setdefault("cache", default_response_cache.cache)
         kwargs.setdefault(
             "reranker",
             build_reranker(runtime, metrics=metrics),

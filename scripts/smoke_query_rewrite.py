@@ -20,7 +20,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(
     0,
-    os.path.join(os.path.dirname(__file__), "..", "common_core", "src"),
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "common_core", "src"
+    ),
 )
 
 import asyncio

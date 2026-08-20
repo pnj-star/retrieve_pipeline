@@ -5,6 +5,11 @@
 > 状态：已实施  
 > 定位：只优化 `rag_skill` 自身可复用能力，不把多 Agent 编排、评测、可观测、合规、模型服务化等宿主平台事项塞进 skill。
 
+> 当前状态说明：本计划为历史文档。`rag_skill` 现已收敛为检索专用，MCP 只暴露
+> `rag_retrieve`；上下文组装、生成、护栏已下沉到工作区顶层的 `common_core.rag`，
+> 供 agent / 多 agent 框架复用（`rag_skill` 不再内置 `common_core` 副本）。文中
+> `rag_answer` 与 skill 内置的生成/护栏改动视为已废除，请以 `SKILL.md` 与 `common_core.rag` 为准。
+
 ## 1. 背景与目标
 
 目标：让 `rag_skill` 成为边界清晰、接口稳定、预算安全、身份可靠的可复用 RAG 能力包。
