@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
 
 from common_core.config import RuntimeConfig, VectorStoreConfig
 from common_core.context import AgentContext
-from rag_skill.builder import build_pipeline, build_runtime
-from rag_skill.pipeline import DEFAULT_TEXT_OUTPUT_FIELDS, RagPipeline, format_context
-from rag_skill.results import RetrieveStatus
-from rag_skill.stages import (
+from retrieve_skill.builder import build_pipeline, build_retrieval_cache, build_runtime
+from retrieve_skill.pipeline import DEFAULT_TEXT_OUTPUT_FIELDS, RagPipeline
+from retrieve_skill.results import RetrieveStatus
+from retrieve_skill.stages import (
     QueryRewriteConfig,
     QueryRewriter,
     Reranker,
@@ -173,7 +172,6 @@ def make_pipeline(
     tenant_filter: bool = True,
     metrics: FakeMetrics | None = None,
     default_output_fields: tuple[str, ...] | None = None,
-    count_tokens: Callable[[str], int] | None = None,
 ) -> RagPipeline:
     cache = cache or FakeCache()
     return RagPipeline(
@@ -189,7 +187,6 @@ def make_pipeline(
         tenant_filter=tenant_filter,
         metrics=metrics,
         default_output_fields=default_output_fields,
-        count_tokens=count_tokens,
     )
 
 
@@ -232,80 +229,11 @@ def test_build_pipeline_defaults_include_stages() -> None:
     assert isinstance(pipeline.retrieval_cache, RetrievalCache)
     assert isinstance(pipeline.reranker, Reranker)
     assert pipeline.min_relevance == 0.70
-    assert pipeline.count_tokens is not None
 
 
 def test_build_pipeline_can_skip_default_stages() -> None:
     pipeline = build_pipeline(runtime=build_runtime(env={}), include_defaults=False)
     assert pipeline.reranker is None
-
-
-def test_format_context_keeps_relevant_fields() -> None:
-    text = format_context(
-        [
-            {"content": "first chunk", "source": "kb.md", "score": 0.9},
-            {"content": "second chunk", "source": "kb.md", "score": 0.7},
-        ]
-    )
-    assert "[1]" in text
-    assert "first chunk" in text
-    assert "score: 0.9" in text
-
-
-def test_format_context_forwards_budget_params(monkeypatch) -> None:
-    captured: dict = {}
-
-    def fake_build_context_text(docs, **kwargs):
-        captured.update(kwargs)
-        return "context", ["source"]
-
-    monkeypatch.setattr(
-        "rag_skill.pipeline.build_context_text",
-        fake_build_context_text,
-    )
-
-    text = format_context(
-        [{"content": "doc"}],
-        max_chars=120,
-        prefix_blocks=["P" * 20],
-        source_label="url",
-        max_doc_chars=40,
-        max_doc_tokens=30,
-        max_tokens=200,
-        count_tokens=lambda value: len(value),
-    )
-
-    assert text == "context"
-    assert captured["max_chars"] == 120
-    assert captured["prefix_blocks"] == ["P" * 20]
-    assert captured["source_label"] == "url"
-    assert captured["max_doc_chars"] == 40
-    assert captured["max_doc_tokens"] == 30
-    assert captured["max_tokens"] == 200
-    assert captured["count_tokens"] is not None
-
-
-def test_format_context_defaults_token_counter_for_token_budget(monkeypatch) -> None:
-    captured: dict = {}
-
-    def fake_build_context_text(docs, **kwargs):
-        captured.update(kwargs)
-        return "context", ["source"]
-
-    monkeypatch.setattr(
-        "rag_skill.pipeline.build_context_text",
-        fake_build_context_text,
-    )
-    monkeypatch.setattr("rag_skill.pipeline.build_token_counter", lambda: len)
-
-    text = format_context(
-        [{"content": "doc"}],
-        max_tokens=100,
-    )
-
-    assert text == "context"
-    assert captured["count_tokens"] is len
-    assert captured["max_tokens"] == 100
 
 
 def test_retrieve_injects_tenant_and_kb_filter() -> None:
@@ -422,6 +350,18 @@ def test_retrieve_query_rewrite_mode_overrides_and_writes_trace() -> None:
 def test_build_pipeline_defaults_include_retrieval_cache() -> None:
     pipeline = build_pipeline(runtime=build_runtime(env={}))
     assert isinstance(pipeline.retrieval_cache, RetrievalCache)
+
+
+def test_build_retrieval_cache_uses_runtime_ttl() -> None:
+    cache = build_retrieval_cache(runtime=build_runtime(env={"REDIS_DEFAULT_TTL": "120"}))
+    assert cache.default_ttl == 120
+    assert (
+        build_retrieval_cache(
+            runtime=build_runtime(env={}),
+            default_ttl=30,
+        ).default_ttl
+        == 30
+    )
 
 
 def test_retrieve_context_cache_hit_skips_providers() -> None:

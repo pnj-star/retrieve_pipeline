@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from common_core.config import RuntimeConfig
 from common_core.context import AgentContext
@@ -20,7 +20,6 @@ from common_core.instrumentation import trace_node
 from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 from common_core.providers.vector import build_filter_expr
-from common_core.rag.assembly import DEFAULT_MAX_CONTEXT_CHARS, build_context_text, clean_markdown
 
 from .results import RetrieveResult, RetrieveStatus
 from .stages import (
@@ -30,12 +29,14 @@ from .stages import (
     RetrievalCache,
     judge_relevance,
 )
-from .tokenization import build_token_counter
 
 logger = logging.getLogger(__name__)
 
 # 混合检索默认返回的文本字段。不同集合的 schema 可通过
 # runtime.vector.text_output_fields 或调用方显式传入 output_fields 覆盖，避免查询报错。
+# id 为 Milvus 主键（子块身份），始终随结果返回（见 providers.vector._to_docs），
+# 供评估/回答节点回查具体子块；parent_id 依赖集合 schema，需按需加入
+# MILVUS_OUTPUT_FIELDS（默认 .env.example 已包含），缺该字段的集合请勿硬编码。
 DEFAULT_TEXT_OUTPUT_FIELDS: tuple[str, ...] = (
     "id",
     "content",
@@ -88,110 +89,12 @@ def merge_retrieval_docs(
     return list(merged.values())
 
 
-def _format_doc(index: int, doc: dict[str, Any]) -> str:
-    """把单个文档格式化为给 LLM 看的一行上下文片段。
-
-    优先使用父块内容（parent_content），其次使用当前块内容（content）；
-    再用 source / category / score 补充来源与相关性信息。
-
-    参数:
-        index: 文档在上下文中的序号，输出时作为 [index] 前缀。
-        doc: 单篇检索返回的文档字典，支持 parent_content、content、
-            source、category、score 等字段。
-
-    返回:
-        格式化后的单行上下文文本。
-    """
-    content = str(doc.get("parent_content", "") or doc.get("content", "") or "")
-    return _render_fields(
-        index,
-        {
-            "content": clean_markdown(content) if content.strip() else None,
-            "source": doc.get("source"),
-            "category": doc.get("category"),
-            "score": doc.get("score"),
-        },
-    )
-
-
-def _render_fields(index: int, fields: dict[str, Any]) -> str:
-    """把有序字段渲染成 `[index] | 字段: 值` 的单行上下文片段。
-
-    所有调用方共用的渲染骨架：字段值为空或空白时跳过，避免输出 ``field: `` 空壳。
-    """
-    parts = [f"[{index}]"]
-    for field_name, value in fields.items():
-        if value is not None and str(value).strip():
-            parts.append(f"{field_name}: {value}")
-    return " | ".join(parts)
-
-
-def format_context(
-    docs: Iterable[dict[str, Any]],
-    *,
-    include_fields: tuple[str, ...] = ("content", "source", "score"),
-    max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
-    prefix_blocks: Sequence[str] | None = None,
-    source_label: str = "source",
-    max_doc_chars: int | None = None,
-    max_doc_tokens: int | None = None,
-    max_tokens: int | None = None,
-    count_tokens: Callable[[str], int] | None = None,
-) -> str:
-    """用自定义字段集把文档拼接成上下文文本（测试 / 调试辅助函数）。
-
-    预算参数与 ``build_context_text`` 对齐：max_chars / max_tokens 控制总体上限，
-    max_doc_chars / max_doc_tokens 控制单篇（或同一父块合并后）上限；
-    传了 max_tokens 且未传 count_tokens 时，自动使用 build_token_counter()。
-
-    参数:
-        docs: 待拼接的文档字典可迭代对象。
-        include_fields: 每个文档要输出的字段名列表，按顺序渲染成 "字段: 值"。
-        max_chars: 整个上下文的最大字符数上限。
-        prefix_blocks: 放在上下文最前面的固定文本块（如系统指引），可为 None。
-        source_label: 主标识字段名，在 build_context_text 内用于控制文档分组。
-        max_doc_chars: 单篇（或合并后同源块）的最大字符数；None 表示不限制。
-        max_doc_tokens: 单篇（或合并后同源块）的最大 token 数；None 表示不限制。
-        max_tokens: 整个上下文的最大 token 数；需配合 count_tokens 使用。
-        count_tokens: 把字符串换算成 token 数的函数；未传且用了 max_tokens 时自动构建。
-
-    返回:
-        拼接好的上下文文本字符串。
-    """
-    def _format(index: int, doc: dict[str, Any]) -> str:
-        """把单个文档按 include_fields 渲染成一行，前面带 [序号]。
-
-        参数:
-            index: 当前文档序号。
-            doc: 单个文档字典。
-
-        返回:
-            格式化后的单行文本。
-        """
-        return _render_fields(index, {name: doc.get(name) for name in include_fields})
-
-    if max_tokens is not None and count_tokens is None:
-        count_tokens = build_token_counter()
-
-    return build_context_text(
-        docs,
-        max_chars=max_chars,
-        prefix_blocks=prefix_blocks,
-        source_label=source_label,
-        format_doc=_format,
-        max_doc_chars=max_doc_chars,
-        max_doc_tokens=max_doc_tokens,
-        max_tokens=max_tokens,
-        count_tokens=count_tokens,
-    )[0]
-
-
 class RagPipeline:
-    """RAG 检索 / 回答管线。
+    """RAG 检索管线。
 
     所有组件依赖都可以传入（便于测试注入 fake），未传入的参数会从
     runtime 配置构建默认实现：
-      - llm: OpenAI 兼容 LLM
+      - llm: OpenAI 兼容 LLM（用于查询改写）
       - vector: Milvus 向量库（混合检索）
       - embedder: 本地 Embedding 模型
       - cache: Redis 底层缓存（服务于检索缓存）
@@ -212,24 +115,22 @@ class RagPipeline:
         query_rewriter: QueryRewriter | None = None,
         min_relevance: float | None = None,
         tenant_filter: bool = True,
-        count_tokens: Callable[[str], int] | None = None,
         default_output_fields: Iterable[str] | None = None,
     ) -> None:
         """组装整条 RAG 管线：未显式注入的组件从 runtime 配置默认构建。
 
         参数:
             runtime: common_core 的运行配置；未传则从环境变量构建。
-            llm: OpenAI 兼容 LLM 实例，用于生成回答；未传用 runtime.llm 默认构建。
+            llm: OpenAI 兼容 LLM 实例，用于查询改写；未传用 runtime.llm 默认构建。
             vector: Milvus 向量库实例，用于混合检索；未传则默认构建。
             embedder: 本地 Embedding 模型，用于生成查询向量；未传则默认构建。
-            cache: Redis 底层缓存实例（供响应缓存复用连接）；未传则默认构建。
+            cache: Redis 底层缓存实例（供检索缓存复用连接）；未传则默认构建。
             metrics: 可观测性 / 指标上报对象；为 None 则不上报指标。
             reranker: 交叉编码器精排器；None 表示不启用精排。
             retrieval_cache: 检索结果缓存实例（query → 精排后文档）；None 表示不启用。
             query_rewriter: 查询改写器；None 则用默认 QueryRewriter。
             min_relevance: 精排后的最低相关性阈值；None 时用 runtime 默认值。
             tenant_filter: 是否强制按 tenant_id/kb_id 做隔离过滤，默认 True。
-            count_tokens: 字符串转 token 数函数，用于 token 预算控制；None 用默认。
             default_output_fields: 检索默认返回的字段；None 用 runtime/内置默认值。
         """
         self.runtime = runtime or RuntimeConfig.from_env()
@@ -261,7 +162,6 @@ class RagPipeline:
             else self.runtime.retrieval.min_relevance
         )
         self.tenant_filter = tenant_filter
-        self.count_tokens = count_tokens
         self.default_output_fields = tuple(
             default_output_fields
             if default_output_fields is not None
@@ -408,7 +308,7 @@ class RagPipeline:
         """构造响应缓存用的 key，决定哪些请求共享/隔离同一个缓存。
 
         设计要点：
-        - ``off`` / ``identity`` 保持原查询为 key，这样缓存命中时连改写都不用跑；
+        - ``off`` 保持原查询为 key，这样缓存命中时连改写都不用跑；
         - 显式传入的 ``rewrite_query`` 会把 key 绑定到该改写文本上，避免不同
           改写内容之间互相串缓存；
         - 会改变查询文本的改写模式（如 ``llm_rewrite``）也单独开一个桶，
@@ -416,7 +316,7 @@ class RagPipeline:
 
         参数:
             query: 原始用户查询文本。
-            mode: 最终生效的改写模式（off/identity/llm_rewrite/query_expansion 等）。
+            mode: 最终生效的改写模式（off/llm_rewrite/query_expansion 等）。
             rewrite_query: 显式传入的改写后查询；None 表示没有。
 
         返回:
@@ -426,7 +326,7 @@ class RagPipeline:
         explicit = None if rewrite_query is None else str(rewrite_query).strip()
         if explicit:
             key = f"{key}\x1f{explicit}"
-        elif mode not in ("off", "identity"):
+        elif mode != "off":
             key = f"{key}\x1f{mode}"
         return key
 
@@ -507,7 +407,7 @@ class RagPipeline:
     ) -> list[dict[str, Any]]:
         """执行查询改写（默认关闭）与混合检索，返回候选文档列表。
 
-        查询改写支持 ``off`` / ``identity`` / ``llm_rewrite`` / ``query_expansion``；
+        查询改写支持 ``off`` / ``llm_rewrite`` / ``query_expansion``；
         改写失败自动回退原始查询，不影响检索可用性。显式传入 ``rewrite_query``
         时跳过改写，直接用该文本检索。改写明细会写入 ``rewrite_trace``（若有）。
 
@@ -652,7 +552,7 @@ class RagPipeline:
         流程与企业检索标准一致：
         1. 先查检索缓存（key = 原始查询 + 改写模式分桶，按 tenant/kb 隔离）。
            命中 → 直接返回缓存的精排后文档（status=retrieved_cache）。
-        2. 未命中 → 查询改写（off/identity/llm_rewrite/query_expansion）。
+        2. 未命中 → 查询改写（off/llm_rewrite/query_expansion）。
         3. 混合检索（稀疏 + 稠密）：两者都空 → status=no_context。
         4. 至少一方有结果 → RRF 融合 → top_k。
         5. 交叉编码器精排，与相关性阈值比较：全部低于阈值 → status=no_context。

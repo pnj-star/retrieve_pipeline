@@ -1,5 +1,5 @@
 {
-  "extraPaths": ["./src", "../common_core/src"],
+  "extraPaths": ["./src"],
   "include": ["src"],
   "exclude": ["**/__pycache__"]
 }

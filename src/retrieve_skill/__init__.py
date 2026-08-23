@@ -5,7 +5,7 @@
 （create_mcp_server / main），以及检索侧阶段（重排、查询改写、检索缓存）。
 
 回答侧的上下文组装 / 生成 / 护栏位于 ``common_core.rag``，
-供 rag_skill 之外的 agent / 多 agent 框架复用。
+供 retrieve_skill 之外的 agent / 多 agent 框架复用。
 """
 
 from .builder import build_pipeline, build_runtime
@@ -18,7 +18,6 @@ from .stages import (
     judge_relevance,
     rank_docs,
 )
-from .tokenization import build_token_counter, make_token_counter
 
 __all__ = [
     "RagPipeline",
@@ -28,11 +27,9 @@ __all__ = [
     "RetrieveStatus",
     "build_pipeline",
     "build_runtime",
-    "build_token_counter",
     "create_mcp_server",
     "judge_relevance",
     "main",
-    "make_token_counter",
     "rank_docs",
 ]
 

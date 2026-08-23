@@ -8,8 +8,8 @@ import pytest
 
 from common_core.config import QueryRewriteConfig
 from common_core.context import AgentContext
-from rag_skill.stages import QueryRewriteResult, QueryRewriter
-from rag_skill.stages.query_rewrite import normalize_query_rewrite_mode
+from retrieve_skill.stages import QueryRewriteResult, QueryRewriter
+from retrieve_skill.stages.query_rewrite import normalize_query_rewrite_mode
 
 
 class FakeLLM:
@@ -43,8 +43,8 @@ def test_normalize_mode_defaults_to_off() -> None:
     assert normalize_query_rewrite_mode("bogus") == "off"
 
 
-def test_off_and_identity_return_original_query() -> None:
-    for mode in ("off", "identity"):
+def test_off_returns_original_query() -> None:
+    for mode in ("off",):
         rewriter = QueryRewriter(FakeLLM(), QueryRewriteConfig(mode=mode))
         result = run(rewriter.rewrite("  帮我查一下退款政策  ", make_context()))
         assert result.mode == mode
@@ -115,10 +115,10 @@ def test_scoped_mode_overrides_default() -> None:
         FakeLLM(),
         QueryRewriteConfig(
             mode="off",
-            scoped_modes={"t1/kb1": "identity", "t2/*": "query_expansion"},
+            scoped_modes={"t1/kb1": "off", "t2/*": "query_expansion"},
         ),
     )
-    assert rewriter.resolve_mode(make_context("t1", "kb1")) == "identity"
+    assert rewriter.resolve_mode(make_context("t1", "kb1")) == "off"
     assert rewriter.resolve_mode(make_context("t2", "kb9")) == "query_expansion"
     # 未匹配作用域时回退默认 off
     assert rewriter.resolve_mode(make_context("t9", "kb9")) == "off"

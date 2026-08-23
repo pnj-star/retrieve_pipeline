@@ -3,14 +3,15 @@
 
 import asyncio
 
+import httpx
 import pytest
 
 pytest.importorskip("mcp")
 
 from common_core.config import AuthConfig
 from common_core.context import AgentContext
-from rag_skill.mcp import create_mcp_server
-from rag_skill.results import RetrieveResult, RetrieveStatus
+from retrieve_skill.mcp import create_mcp_server
+from retrieve_skill.results import RetrieveResult, RetrieveStatus
 
 
 class FakePipeline:
@@ -32,6 +33,24 @@ class FakePipeline:
         )
 
 
+class FailingPipeline(FakePipeline):
+    async def retrieve_context(
+        self,
+        query: str,
+        context: AgentContext | None = None,
+        **kwargs,
+    ) -> RetrieveResult:
+        raise RuntimeError("milvus down")
+
+
+class RecordingMetrics:
+    def __init__(self) -> None:
+        self.errors: list[dict] = []
+
+    def record_node_error(self, node: str, tenant_id: str = "", kb_id: str = "") -> None:
+        self.errors.append({"node": node, "tenant_id": tenant_id, "kb_id": kb_id})
+
+
 def _payload(result):
     return result[1] if isinstance(result, tuple) else result
 
@@ -45,6 +64,116 @@ def test_mcp_server_exposes_rag_tools() -> None:
     names = {tool.name for tool in _run(server.list_tools())}
     assert "rag_retrieve" in names
     assert "rag_answer" not in names
+
+
+def test_mcp_server_registers_health_route() -> None:
+    server = create_mcp_server(pipeline=FakePipeline(), auth=AuthConfig(mode="disabled"))
+
+    async def request_health() -> dict:
+        app = server.streamable_http_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+        return response.json()
+
+    payload = _run(request_health())
+    assert payload["status"] == "ok"
+    assert payload["service"] == "retrieve-skill"
+    assert payload["tools"] == ["rag_retrieve"]
+
+
+def test_health_route_stays_anonymous_with_jwt_auth() -> None:
+    server = create_mcp_server(
+        pipeline=FakePipeline(),
+        auth=AuthConfig(mode="jwt", jwt_secret="test-secret-key-0123456789abcdef"),
+    )
+
+    async def request_health() -> dict:
+        app = server.streamable_http_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+        return response.json()
+
+    payload = _run(request_health())
+    assert payload["status"] == "ok"
+    assert payload["service"] == "retrieve-skill"
+
+
+def test_rag_retrieve_returns_structured_error_on_pipeline_exception() -> None:
+    metrics = RecordingMetrics()
+    server = create_mcp_server(
+        pipeline=FailingPipeline(),
+        auth=AuthConfig(mode="disabled"),
+        metrics=metrics,
+    )
+    result = _run(
+        server.call_tool(
+            "rag_retrieve",
+            {
+                "query": "policy lookup",
+                "tenant_id": "t9",
+                "kb_id": "kb9",
+                "request_id": "r9",
+            },
+        )
+    )
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["status"] == RetrieveStatus.ERROR
+    assert payload["count"] == 0
+    assert payload["docs"] == []
+    assert "milvus down" in payload["message"]
+    assert payload["tenant_id"] == "t9"
+    assert metrics.errors == [
+        {"node": "rag_retrieve", "tenant_id": "t9", "kb_id": "kb9"}
+    ]
+
+
+def test_rag_retrieve_uses_transport_bearer_token_when_auth_arg_omitted() -> None:
+    import time
+
+    import jwt
+    from mcp.server.auth.middleware.auth_context import auth_context_var
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+    from mcp.server.auth.provider import AccessToken
+
+    secret = "test-secret-key-0123456789abcdef"
+    token = jwt.encode(
+        {
+            "exp": int(time.time()) + 3600,
+            "sub": "user-t",
+            "tenant_id": "t1",
+            "kb_id": "kb1",
+        },
+        secret,
+        algorithm="HS256",
+    )
+    server = create_mcp_server(
+        pipeline=FakePipeline(),
+        auth=AuthConfig(mode="jwt", jwt_secret=secret),
+    )
+
+    async def invoke() -> dict:
+        auth_context_var.set(
+            AuthenticatedUser(AccessToken(token=token, client_id="user-t", scopes=["agent"]))
+        )
+        result = await server.call_tool(
+            "rag_retrieve",
+            {
+                "query": "policy lookup",
+                "tenant_id": "t1",
+                "kb_id": "kb1",
+                "request_id": "r1",
+            },
+        )
+        return _payload(result)
+
+    payload = _run(invoke())
+    assert payload["ok"] is True
+    assert payload["tenant_id"] == "t1"
 
 
 def test_rag_retrieve_accepts_traceparent_and_returns_trace_id() -> None:
@@ -64,8 +193,8 @@ def test_rag_retrieve_accepts_traceparent_and_returns_trace_id() -> None:
     )
     payload = _payload(result)
     assert payload["docs"][0]["content"] == "doc"
-    assert "context_text" in payload
-    assert payload["context_text"]
+    assert "context_text" not in payload
+    assert "child_ids" in payload["docs"][0]
     assert "trace_id" in payload
     assert payload["status"] == "retrieved"
 
@@ -105,17 +234,15 @@ def test_rag_retrieve_accepts_budget_params() -> None:
                 "kb_id": "kb4",
                 "request_id": "r4",
                 "context_max_chars": 200,
-                "context_max_tokens": 512,
                 "max_doc_chars": 300,
-                "max_doc_tokens": 150,
             },
         )
     )
     payload = _payload(result)
     assert payload["ok"] is True
     assert payload["count"] == 1
-    assert "context_text" in payload
-    assert payload["context_text"]
+    assert "context_text" not in payload
+    assert payload["docs"][0]["content"] == "doc"
     assert payload["cache_hit"] is False
 
 
@@ -141,6 +268,48 @@ def test_rag_retrieve_forwards_query_rewrite_options() -> None:
     assert call["query_rewrite_mode"] == "query_expansion"
     assert call["rewrite_query"] == "改写后的问题"
     assert payload["rewritten_query"] == "改写后的问题"
+
+
+class IdentityPipeline(FakePipeline):
+    async def retrieve_context(
+        self,
+        query: str,
+        context: AgentContext | None = None,
+        **kwargs,
+    ) -> RetrieveResult:
+        self.calls.append({"op": "retrieve_context", "query": query, "context": context, **kwargs})
+        return RetrieveResult(
+            RetrieveStatus.RETRIEVED,
+            docs=[
+                {
+                    "id": "chunk-42",
+                    "parent_id": "parent-7",
+                    "content": "doc",
+                    "score": 0.9,
+                }
+            ],
+            rewritten_query=query,
+            message="ok",
+        )
+
+
+def test_rag_retrieve_exposes_chunk_identity_in_context() -> None:
+    server = create_mcp_server(pipeline=IdentityPipeline(), auth=AuthConfig(mode="disabled"))
+    result = _run(
+        server.call_tool(
+            "rag_retrieve",
+            {
+                "query": "policy lookup",
+                "tenant_id": "t5",
+                "kb_id": "kb5",
+                "request_id": "r5",
+            },
+        )
+    )
+    payload = _payload(result)
+    assert payload["docs"][0]["id"] == "parent-7"
+    assert payload["docs"][0]["parent_id"] == "parent-7"
+    assert payload["docs"][0]["child_ids"] == ["chunk-42"]
 
 
 class EmptyPipeline(FakePipeline):

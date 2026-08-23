@@ -1,8 +1,8 @@
 """从环境变量（或显式传入参数）组装 runtime、provider、cache、reranker 等实例。
 
-本模块是整个 rag_skill 的装配层：把 common_core 提供的通用能力
-（LLM、向量库、Embedding、Redis 缓存）与 rag_skill 自己的阶段
-（重排器、响应缓存）组合成一个可直接运行的 RagPipeline。
+本模块是整个 retrieve_skill 的装配层：把 common_core 提供的通用能力
+（LLM、向量库、Embedding、Redis 缓存）与 retrieve_skill 自己的阶段
+（重排器、检索缓存）组合成一个可直接运行的 RagPipeline。
 """
 
 from __future__ import annotations
@@ -12,10 +12,9 @@ from typing import Any
 
 from common_core.config import RuntimeConfig, load_env_files
 from common_core.observability import Observability
-from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
+from common_core.providers import RedisCache
 
 from .stages import Reranker, RetrievalCache
-from .tokenization import build_token_counter
 
 
 # 模型应尽量从本地 HuggingFace 缓存加载，避免首次推理去访问 HF_ENDPOINT
@@ -45,53 +44,6 @@ def build_runtime(
         load_env_files(*dotenv_paths, override=override)
     source = dict(env) if env is not None else None
     return RuntimeConfig.from_env(env=source)
-
-
-def build_llm(
-    runtime: RuntimeConfig | None = None,
-    *,
-    metrics: Observability | None = None,
-) -> OpenAICompatibleLLM:
-    """构建 OpenAI 兼容的 LLM 客户端，未传 runtime 时自动从环境构建。
-
-    参数:
-        runtime: 运行时配置；None 时用 build_runtime() 从环境构建。
-        metrics: 可观测性 / 指标对象，挂载到 LLM 上；可为 None。
-
-    返回:
-        OpenAICompatibleLLM 实例。
-    """
-    runtime = runtime or build_runtime()
-    return OpenAICompatibleLLM(runtime.llm, metrics=metrics)
-
-
-def build_vector(runtime: RuntimeConfig | None = None) -> MilvusVectorStore:
-    """构建 Milvus 向量库客户端，支持混合检索（稀疏 + 稠密）。
-
-    参数:
-        runtime: 运行时配置；None 时从环境构建。
-
-    返回:
-        配置好并发度的 MilvusVectorStore 实例。
-    """
-    runtime = runtime or build_runtime()
-    return MilvusVectorStore(
-        runtime.vector,
-        max_workers=runtime.retrieval.hybrid_max_workers,
-    )
-
-
-def build_embedder(runtime: RuntimeConfig | None = None) -> LocalEmbedder:
-    """构建本地 Embedding 模型，用于把查询转成稠密向量。
-
-    参数:
-        runtime: 运行时配置；None 时从环境构建。
-
-    返回:
-        LocalEmbedder 实例。
-    """
-    runtime = runtime or build_runtime()
-    return LocalEmbedder(config=runtime.llm)
 
 
 def build_cache(
@@ -167,11 +119,11 @@ def build_retrieval_cache(
         配置好的 RetrievalCache 实例。
     """
     runtime = runtime or build_runtime()
-    return RetrievalCache(
-        cache or build_cache(runtime),
-        metrics=metrics,
-        **overrides,
-    )
+    kwargs = dict(overrides)
+    # 检索缓存 TTL 契约默认跟随 REDIS_DEFAULT_TTL，调用方仍可显式覆盖。
+    kwargs.setdefault("default_ttl", runtime.cache.default_ttl)
+    kwargs.setdefault("metrics", metrics)
+    return RetrievalCache(cache or build_cache(runtime), **kwargs)
 
 
 def build_pipeline(
@@ -183,16 +135,14 @@ def build_pipeline(
 ) -> Any:
     """组装完整的 RagPipeline。
 
-    - include_defaults=True 时自动注入检索缓存、重排器与 token 计数；
+    - include_defaults=True 时自动注入检索缓存与重排器；
       测试场景可传 False 跳过这些阶段（置为 None）。
-    - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker、count_tokens 等 RagPipeline 参数）；
-    - count_tokens 推荐使用 ``build_token_counter()``：tiktoken 可用时按真实 token 计数，
-      不可用时回退为字符数。
+    - overrides 中的键会覆盖默认构造的组件（如传入自定义 reranker 等 RagPipeline 参数）。
 
     参数:
         runtime: 运行时配置；None 时从环境构建。
         metrics: 可观测性 / 指标对象；可为 None。
-        include_defaults: 是否自动注入检索缓存、重排器与 token 计数；
+        include_defaults: 是否自动注入检索缓存与重排器；
             测试场景可传 False 跳过这些阶段（对应组件置为 None）。
         overrides: 透传给 RagPipeline 构造器的参数；与默认注入的组件冲突时以显式传入为准。
 
@@ -213,7 +163,6 @@ def build_pipeline(
             "reranker",
             build_reranker(runtime, metrics=metrics),
         )
-        kwargs.setdefault("count_tokens", build_token_counter())
     return RagPipeline(
         runtime=runtime,
         metrics=metrics,

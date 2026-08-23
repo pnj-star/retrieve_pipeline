@@ -1,4 +1,4 @@
-r"""rag_skill 查询改写真实链路冒烟。
+r"""retrieve_skill 查询改写真实链路冒烟。
 
 依赖（本地已具备）：Docker 内的 Milvus + Redis、缓存的
 ``BAAI/bge-small-zh-v1.5`` embedding 模型、pymilvus / sentence_transformers。
@@ -7,23 +7,15 @@ r"""rag_skill 查询改写真实链路冒烟。
 开 / 关无回归，以及 ``llm_rewrite`` / ``query_expansion`` 真正进入检索并透出
 ``rewritten_query``。LLM 改写文本用可控桩代替（无真实 LLM 凭据）。
 
-运行（请先启动 Docker 内的 Milvus 与 Redis）：
+运行前先安装依赖（``pip install -e ../common_core`` 与
+``pip install -e retrieve_skill``），并启动 Docker 内的 Milvus 与 Redis：
     $env:HF_HUB_OFFLINE='1'
-    & D:\python\python.exe rag_skill\scripts\smoke_query_rewrite.py
+    & D:\python\python.exe retrieve_skill\scripts\smoke_query_rewrite.py
 """
 
 from __future__ import annotations
 
 import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__), "..", "..", "common_core", "src"
-    ),
-)
 
 import asyncio
 from typing import Any
@@ -32,7 +24,7 @@ from common_core.config import CacheConfig, RuntimeConfig, VectorStoreConfig
 from common_core.config import LLMConfig
 from common_core.context import AgentContext
 from common_core.providers import OpenAICompatibleLLM
-from rag_skill.pipeline import RagPipeline
+from retrieve_skill.pipeline import RagPipeline
 
 
 MILVUS_HOST = "127.0.0.1"

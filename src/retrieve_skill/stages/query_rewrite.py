@@ -1,4 +1,4 @@
-"""查询改写阶段：identity / LLM 改写 / 查询扩展。
+"""查询改写阶段：LLM 改写 / 查询扩展。
 
 默认 mode 为 off，完全保持现有检索行为；启用后，改写只影响检索与精排使用的
 查询文本，不改变最终回答针对原始用户问题的语义。LLM 调用失败时自动回退为
@@ -13,14 +13,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from common_core.config import QueryRewriteConfig
+from common_core.config import VALID_QUERY_REWRITE_MODES, QueryRewriteConfig
 from common_core.context import AgentContext
 
 logger = logging.getLogger(__name__)
-
-VALID_QUERY_REWRITE_MODES = frozenset(
-    {"off", "identity", "llm_rewrite", "query_expansion"}
-)
 
 DEFAULT_QUERY_REWRITE_PROMPT = (
     "你是企业知识库检索的查询改写助手。请把用户问题改写成适合向量检索和"
@@ -290,7 +286,7 @@ class QueryRewriter:
         返回:
             QueryRewriteResult，含改写后的查询与变体列表。
         """
-        if mode in {"off", "identity"}:
+        if mode == "off":
             return QueryRewriteResult(
                 mode=mode,
                 original_query=query,

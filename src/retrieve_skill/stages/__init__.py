@@ -1,10 +1,10 @@
-"""rag_skill 的检索侧阶段（stages）。
+"""retrieve_skill 的检索侧阶段（stages）。
 
 本层保留检索相关的通用机制：重排（rerank）、查询改写（query_rewrite）、
 检索缓存（retrieval_cache）。
 
 回答侧的上下文组装（assembly）、生成（generation）与护栏（guard）
-位于共享的 ``common_core.rag``，供 rag_skill 之外的 agent /
+位于共享的 ``common_core.rag``，供 retrieve_skill 之外的 agent /
 多 agent 框架复用，不再属于本 skill。
 """
 

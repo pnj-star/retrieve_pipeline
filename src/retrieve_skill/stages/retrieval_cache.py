@@ -27,7 +27,7 @@ class RetrievalCache:
         cache: RedisCache | None = None,
         *,
         scope: str = "rag_retrieval",
-        default_ttl: int | None = 600,
+        default_ttl: int | None = None,
         metrics: Observability | None = None,
     ) -> None:
         """初始化检索缓存。
@@ -35,7 +35,8 @@ class RetrievalCache:
         参数:
             cache: 底层 Redis 适配器；为 None 时缓存退化（不读写）。
             scope: Redis key 中的命名空间，默认 "rag_retrieval"。
-            default_ttl: 默认缓存过期秒数；None 时用底层配置。
+            default_ttl: 默认缓存过期秒数；None 时用底层 Redis 配置
+                （REDIS_DEFAULT_TTL）。
             metrics: 可观测性 / 指标对象；可为 None。
         """
         self.cache = cache
@@ -44,6 +45,14 @@ class RetrievalCache:
         self.metrics = metrics
 
     def _labels(self, context: AgentContext | None) -> tuple[str, str]:
+        """取出缓存读写与指标打点用的租户标签。
+
+        参数:
+            context: agent 上下文；可为 None（无租户信息）。
+
+        返回:
+            (tenant_id, kb_id) 二元组，缺省时为空字符串。
+        """
         if context is None:
             return "", ""
         return context.tenant_id, context.kb_id
