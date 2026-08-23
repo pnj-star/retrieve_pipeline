@@ -24,19 +24,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install test dependencies
-        run: python -m pip install pytest prometheus-client pyjwt
-
-      - name: Install common_core (shared runtime dependency)
-        run: |
-          if [ -d ../common_core ]; then
-            python -m pip install -e "../common_core[llm,vector,cache,mcp,test]"
-          else
-            python -m pip install "common-core[llm,vector,cache,mcp,test]~=0.1.0"
-          fi
-
-      - name: Install package (editable, runtime deps only)
-        run: python -m pip install -e . --no-deps
+      - name: Install package with dependencies
+        run: python -m pip install -e ".[test,mcp]"
 
       - name: Run tests
         run: python -m pytest
