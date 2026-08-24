@@ -51,8 +51,8 @@ def rank_docs(
 ) -> list[dict[str, Any]]:
     """给文档附加 ``ce_score`` 与融合分数，排序后截断到 top_k。
 
-    当没有 query 或没有 scores 时，前 top_k 个文档原样透传，
-    保证检索上下文不会丢失（例如模型不可用时的优雅降级）。
+    当没有 query 或没有 scores 时，前 top_k 个文档原样透传。
+    调用方若启用质量门禁，必须先保证 scores 来自可用的精排器。
 
     参数:
         docs: 待重排的文档序列。
@@ -87,7 +87,7 @@ def rank_docs(
 
 
 class Reranker:
-    """懒加载的交叉编码器重排器，模型不可用时优雅透传（return passthrough）。"""
+    """懒加载的交叉编码器重排器；模型不可用时显式失败，不做未评分透传。"""
 
     def __init__(
         self,
@@ -96,9 +96,10 @@ class Reranker:
         device: str | None = None,
         top_k: int = 3,
         ce_weight: float = DEFAULT_CE_WEIGHT,
-        retrieval_weight: float = DEFAULT_RETRIEVAL_WEIGHT,
-        score_fn: Callable[[str, Sequence[str]], Sequence[float]] | None = None,
-        metrics: Any = None,
+    retrieval_weight: float = DEFAULT_RETRIEVAL_WEIGHT,
+    score_fn: Callable[[str, Sequence[str]], Sequence[float]] | None = None,
+    scoring_version: str | None = None,
+    metrics: Any = None,
     ) -> None:
         """初始化重排器：记录模型名、运行设备、top_k 与可选评分/指标注入。
 
@@ -109,6 +110,8 @@ class Reranker:
             ce_weight: 交叉编码器分数在融合分中的权重。
             retrieval_weight: 检索原始分数在融合分中的权重。
             score_fn: 可注入的评分函数 (query, contents) -> [float]，用于测试或替换后端。
+            scoring_version: 自定义后端的稳定版本标识；更换评分逻辑时必须递增，
+                以便检索缓存区分不同实现产生的 ce_score。
             metrics: 可观测性 / 指标对象，用于上报重排最佳分数；可为 None。
         """
         self.model_name = model_name
@@ -117,6 +120,7 @@ class Reranker:
         self.ce_weight = ce_weight
         self.retrieval_weight = retrieval_weight
         self.score_fn = score_fn  # 可注入的评分函数（测试 / 替代后端）
+        self.scoring_version = scoring_version or ""
         self.metrics = metrics
         self._model: Any = None
         self._available: bool | None = None  # None=未尝试，True=可用，False=不可用
@@ -125,7 +129,7 @@ class Reranker:
         """首次使用时才加载模型；加载失败则标记不可用并返回 None。
 
         返回:
-            加载成功的模型对象；不可用时返回 None（调用方走透传）。
+            加载成功的模型对象；不可用时返回 None。
         """
         if self._available is False:
             return None
@@ -141,33 +145,33 @@ class Reranker:
                 self._model = CrossEncoder(self.model_name, device=device)
                 self._available = True
             except Exception as exc:
-                # 模型（或依赖）不可用：降级为透传，不阻塞管线
+                # 质量门禁依赖真实 ce_score；模型故障必须由 pipeline fail-closed。
                 logger.warning(
-                    "Reranker model unavailable, using passthrough: %s", exc
+                    "Reranker model unavailable; retrieval must fail closed: %s", exc
                 )
                 self._available = False
                 self._model = None
         return self._model
 
-    def _scores(           # todo
+    def _scores(
         self,
         query: str,
         contents: Sequence[str],
     ) -> Sequence[float] | None:
-        """计算每条内容的相似度分数；无模型 / 无 score_fn 时返回 None。
+        """计算每条内容的相似度分数；模型不可用时显式失败。
 
         参数:
             query: 查询文本。
             contents: 待评分的内容列表，与 docs 一一对应。
 
         返回:
-            与 contents 等长的分数序列；评分不可用时返回 None。
+        与 contents 等长的分数序列。
         """
         if self.score_fn is not None:
             return list(self.score_fn(query, contents))
         model = self._load_model()
         if model is None:
-            return None
+            raise RuntimeError("cross-encoder reranker is unavailable")
         return list(model.predict([(query, content) for content in contents]))
 
     def rank(

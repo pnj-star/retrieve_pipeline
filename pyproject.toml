@@ -8,6 +8,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mysql = ["pymysql>=1.1", "DBUtils>=3.1"]
 mcp = ["mcp>=1.2,<2"]
 test = ["pytest>=8.0,<9"]
 

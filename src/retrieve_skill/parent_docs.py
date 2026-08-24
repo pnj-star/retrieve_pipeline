@@ -1,148 +1,165 @@
-"""父块粒度聚合：把精排后达标的子块合并成一个父块文档。
+"""精排后的父块引用与权威父块内容组装。
 
-检索管线的 ``docs`` 是"子块粒度"的结果：同一个父块可能被切成一串 chunk 且
-全部命中。直接把这批子块交给 agent 会带来两处问题：一是上下文窗口被撑爆，
-二是一段完整依据被拆成很多碎片。本模块把这些命中子块按稳定父块身份合并成
-一个"父块文档"，再做单篇与总量的预算截断，保证返回的 docs 既是完整可读的整段依据、又不会把 agent 的上下文窗口打爆。
-
-每个父块文档保留 ``child_ids``（命中的子块主键列表）与 ``parent_id``，供上层
-评估 agent 据此回查具体子块核对召回是否正确，也兼容 toolbench 用子块 id 做
-golden 召回匹配。
+Milvus 只保存子块和 ``parent_id``；Redis 只缓存精排达标后的轻量父块引用。
+父块正文始终从 authoritative store（当前为 MySQL）回源，并在组装时校验租户、
+知识库、版本与 token / char 预算。
 """
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+import os
+from collections.abc import Callable
+from typing import Any, Mapping, Sequence
 
-from common_core.rag.assembly import DEFAULT_MAX_CONTEXT_CHARS, clean_markdown
+DEFAULT_MAX_CONTEXT_TOKENS = 6000
+DEFAULT_MAX_DOC_TOKENS = 3000
+_TOKEN_ENCODINGS: dict[str, Any] = {}
 
 
-def parent_keys_of(doc: dict[str, Any]) -> tuple[str, ...]:
-    """子块归属的父块身份主键，用于把同父块子块聚成一组。
+def default_token_counter(text: str) -> int:
+    """Count tokens with tiktoken; callers can inject a model-specific counter."""
+    import tiktoken
 
-    按可靠性排序：parent_id 最可靠，其次 parent_title + source，最后退回
-    parent_content / content 前 60 字符的内容指纹。返回所有候选主键，
-    取第一个非空作为分组键；全部为空时视为无父块身份（调用方跳过聚合）。
+    encoding_name = os.getenv("CONTEXT_TOKEN_ENCODING", "cl100k_base")
+    encoding = _TOKEN_ENCODINGS.get(encoding_name)
+    if encoding is None:
+        encoding = tiktoken.get_encoding(encoding_name)
+        _TOKEN_ENCODINGS[encoding_name] = encoding
+    return len(encoding.encode(text))
 
-    参数:
-        doc: 单个子块文档字典。
 
-    返回:
-        可用于分组的身份主键列表（从最可靠到最弱）。
+def build_parent_refs(docs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group qualified children into ranked parent references.
+
+    The reference list is the only retrieval result stored in Redis. Parent
+    text is intentionally omitted so MySQL remains the authoritative source.
     """
-    scope = "\x00".join(
-        str(doc.get(field, "") or "")
-        for field in ("tenant_id", "kb_id", "source")
-    )
-    parent_id = str(doc.get("parent_id", "") or "").strip()
-    if parent_id:
-        return (f"{scope}\x00parent:{parent_id}",)
-    parent_title = str(doc.get("parent_title", "") or "").strip()
-    if parent_title:
-        return (f"{scope}\x00title:{parent_title}",)
-    content = str(doc.get("parent_content", "") or doc.get("content", "") or "").strip()
-    if content:
-        return (f"{scope}\x00content:{content[:60]}",)
-    return ()
-
-
-def _merge_child_content(group: Sequence[dict[str, Any]]) -> str:
-    """把同一父块的多个子块正文按 chunk 顺序合并去重，剔除空块。"""
-    ranked = sorted(
-        enumerate(group),
-        key=lambda item: _chunk_sort_key(item[1], item[0]),
-    )
-    seen: set[str] = set()
-    parts: list[str] = []
-    for _position, doc in ranked:
-        text = clean_markdown(str(doc.get("content", "") or "")).strip()
-        if text and text not in seen:
-            seen.add(text)
-            parts.append(text)
-    return "\n\n".join(parts)
-
-
-def _chunk_sort_key(doc: dict[str, Any], position: int) -> tuple[int, int]:
-    """返回可排序的 chunk 序号；缺失或非法时回退到输入顺序（视为排最后）。"""
-    raw = doc.get("chunk_index")
-    try:
-        return (int(str(raw).strip()), position)
-    except (TypeError, ValueError):
-        return (2**31, position)
-
-
-def _parent_content(group: Sequence[dict[str, Any]]) -> str:
-    """取父块全文；找不到时退回子块合并结果。"""
-    for doc in group:
-        text = str(doc.get("parent_content", "") or "").strip()
-        if text:
-            return text
-    return _merge_child_content(group)
-
-
-def _max_number(*values: Any) -> float | None:
-    """取这些值里合法的最大数值；全都非法时返回 None。"""
-    numbers = []
-    for value in values:
-        if value is None:
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for position, doc in enumerate(docs):
+        parent_id = str(doc.get("parent_id", "") or "").strip()
+        if not parent_id:
             continue
-        try:
-            numbers.append(float(value))
-        except (TypeError, ValueError):
-            continue
-    return max(numbers) if numbers else None
+        scope = "\x00".join(
+            str(doc.get(field, "") or "")
+            for field in ("tenant_id", "kb_id")
+        )
+        key = f"{scope}\x00{parent_id}"
+        if key not in grouped:
+            grouped[key] = {
+                "tenant_id": str(doc.get("tenant_id", "") or ""),
+                "kb_id": str(doc.get("kb_id", "") or ""),
+                "parent_id": parent_id,
+                "child_ids": [],
+                "first_position": position,
+                "ce_score": 0.0,
+                "score": 0.0,
+                "doc_version": doc.get("doc_version"),
+            }
+            order.append(key)
+        group = grouped[key]
+        child_id = str(doc.get("id", "") or "").strip()
+        ce_score = float(doc["ce_score"])
+        score = float(doc.get("score", 0.0) or 0.0)
+        group["child_ids"].append(child_id)
+        if ce_score == group["ce_score"]:
+            group["doc_version"] = doc.get("doc_version")
+        group["ce_score"] = max(float(group["ce_score"]), ce_score)
+        group["score"] = max(float(group["score"]), score)
+
+    refs = []
+    for key in order:
+        item = grouped[key]
+        item.pop("first_position")
+        refs.append(item)
+    refs.sort(
+        key=lambda item: (
+            -float(item["ce_score"]),
+            -float(item["score"]),
+            str(item["parent_id"]),
+        )
+    )
+    return refs
 
 
-def _aggregate_group(
-    key: str,
-    group: Sequence[dict[str, Any]],
-) -> dict[str, Any] | None:
-    """把同一父块的一组子块合并成一个父块文档。"""
-    first = group[0]
-    content = _parent_content(group)
-    if not content.strip():
+def validate_parent_refs(
+    docs: Any,
+    *,
+    threshold: float,
+    context: Any | None = None,
+) -> list[dict[str, Any]] | None:
+    """Validate cached parent references; invalid data is treated as a miss."""
+    if not isinstance(docs, list) or not docs:
         return None
-    child_ids = [
-        str(doc.get("id", "") or "")
-        for doc in group
-        if str(doc.get("id", "") or "").strip()
-    ]
-    doc = {
-        "id": str(first.get("parent_id", "") or first.get("id", "") or ""),
-        "parent_id": str(first.get("parent_id", "") or ""),
-        "child_ids": child_ids,
-        "content": content,
-        "parent_title": first.get("parent_title"),
-        "source": first.get("source"),
-        "category": first.get("category"),
-        "chunk_index": first.get("chunk_index"),
-        "tenant_id": first.get("tenant_id"),
-        "kb_id": first.get("kb_id"),
-    }
-    score = _max_number(*(d.get("score") for d in group))
-    ce_score = _max_number(*(d.get("ce_score") for d in group))
-    if score is not None:
-        doc["score"] = score
-    if ce_score is not None:
-        doc["ce_score"] = ce_score
-    return doc
+    validated: list[dict[str, Any]] = []
+    seen_parents: set[str] = set()
+    for item in docs:
+        if not isinstance(item, dict):
+            return None
+        parent_id = str(item.get("parent_id", "") or "").strip()
+        child_ids_raw = item.get("child_ids")
+        ce_score = item.get("ce_score")
+        doc_version = item.get("doc_version")
+        if (
+            not parent_id
+            or parent_id in seen_parents
+            or not isinstance(child_ids_raw, list)
+            or not doc_version
+        ):
+            return None
+        child_ids = [str(child or "").strip() for child in child_ids_raw]
+        if not child_ids or any(not child for child in child_ids):
+            return None
+        if len(set(child_ids)) != len(child_ids):
+            return None
+        try:
+            ce_score_value = float(ce_score)
+            doc_version_value = int(str(doc_version).strip())
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 <= ce_score_value <= 1.0 or ce_score_value < threshold:
+            return None
+        score_value = 0.0
+        if item.get("score") is not None:
+            try:
+                score_value = float(item["score"])
+            except (TypeError, ValueError):
+                return None
+        if context is not None:
+            if (
+                str(item.get("tenant_id", "") or "") != context.tenant_id
+                or str(item.get("kb_id", "") or "") != context.kb_id
+            ):
+                return None
+        validated.append({
+            "tenant_id": context.tenant_id if context else str(item.get("tenant_id", "") or ""),
+            "kb_id": context.kb_id if context else str(item.get("kb_id", "") or ""),
+            "parent_id": parent_id,
+            "child_ids": child_ids,
+            "ce_score": ce_score_value,
+            "score": score_value,
+            "doc_version": doc_version_value,
+        })
+        seen_parents.add(parent_id)
+    return validated
 
 
-def _truncate(
+def _truncate_to_limit(
     text: str,
     limit: int,
+    measure: Callable[[str], int],
 ) -> str:
-    """在预算内保留前缀；预算不够放标记时退化为纯前缀。"""
+    """Keep the longest prefix that fits the measured budget."""
     if limit <= 0 or not text:
         return ""
-    if len(text) <= limit:
+    if measure(text) <= limit:
         return text
     marker = " [truncated]"
-    if len(marker) <= limit:
+    if measure(marker) <= limit:
         low, high = 0, len(text)
         while low < high:
             mid = (low + high + 1) // 2
-            if len(text[:mid] + marker) <= limit:
+            if measure(text[:mid] + marker) <= limit:
                 low = mid
             else:
                 high = mid - 1
@@ -151,81 +168,155 @@ def _truncate(
     low, high = 0, len(text)
     while low < high:
         mid = (low + high + 1) // 2
-        if len(text[:mid]) <= limit:
+        if measure(text[:mid]) <= limit:
             low = mid
         else:
             high = mid - 1
     return text[:low]
 
 
-def aggregate_parent_docs(
-    docs: Sequence[dict[str, Any]],
+def assemble_parent_refs(
+    refs: Sequence[dict[str, Any]],
+    parent_rows: Mapping[str, dict[str, Any]],
     *,
-    max_chars: int | None = None,
+    context: Any,
+    count_tokens: Callable[[str], int] | None = None,
+    context_max_tokens: int | None = None,
+    max_doc_tokens: int | None = None,
+    context_max_chars: int | None = None,
     max_doc_chars: int | None = None,
-) -> list[dict[str, Any]]:
-    """把子块 docs 聚合成父块粒度并做预算截断。
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Hydrate parent refs and apply token and optional character budgets."""
+    measure = count_tokens or default_token_counter
+    token_budget = (
+        context_max_tokens
+        if context_max_tokens is not None
+        else DEFAULT_MAX_CONTEXT_TOKENS
+    )
+    per_doc_tokens = (
+        max_doc_tokens
+        if max_doc_tokens is not None and max_doc_tokens > 0
+        else max(1, token_budget // 2)
+    )
+    use_chars = context_max_chars is not None
+    char_budget = context_max_chars if use_chars else 0
+    per_doc_chars = (
+        max(1, max_doc_chars)
+        if max_doc_chars is not None and max_doc_chars > 0
+        else None
+    )
 
-    参数:
-        docs: 精排后达标的子块文档列表；同一父块的多个子块会合并成一篇。
-        max_chars: 合并后 docs 里正文的字符总预算；None 用默认值。
-        max_doc_chars: 单篇父块文档正文的字符上限；None 时用总量的一半。
-
-    返回:
-        父块粒度去重后的文档列表，按首次出现的父块顺序排列。
-    """
-    if not docs:
-        return []
-    groups: dict[str, list[dict[str, Any]]] = {}
-    order: list[str] = []
-    for doc in docs:
-        keys = parent_keys_of(doc)
-        if not keys:
+    parents: list[dict[str, Any]] = []
+    missing_parent_count = 0
+    version_mismatch_count = 0
+    remaining_tokens = token_budget
+    remaining_chars = char_budget
+    for ref in refs:
+        parent_id = str(ref.get("parent_id", "") or "")
+        row = parent_rows.get(parent_id)
+        if not row:
+            missing_parent_count += 1
             continue
-        key = keys[0]
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(doc)
-
-    aggregated: list[dict[str, Any]] = []
-    for key in order:
-        parent = _aggregate_group(key, groups[key])
-        if parent is None:
+        if context is not None and (
+            str(row.get("tenant_id", "") or "") != context.tenant_id
+            or str(row.get("kb_id", "") or "") != context.kb_id
+        ):
+            missing_parent_count += 1
             continue
-        content = str(parent.get("content", "") or "")
-
-        # 单篇预算：显式传了单篇上限则用之，否则取总量预算的一半，避免一篇
-        # 超长父块独占全部配额。
-        total_chars = max_chars if max_chars is not None else DEFAULT_MAX_CONTEXT_CHARS
-        per_chars = (
-            max(1, max_doc_chars)
-            if max_doc_chars is not None and max_doc_chars > 0
-            else max(1, total_chars // 2)
-        )
-        if len(content) > per_chars:
-            content = _truncate(content, per_chars)
-
-        parent["content"] = content if content.strip() else ""
-        aggregated.append(parent)
-
-    # 总量预算：按聚合后的顺序逐篇扣减，超过总量就丢弃后面的篇幅（保留已
-    # 放行的父块完整性）。
-    total = max_chars if max_chars is not None else DEFAULT_MAX_CONTEXT_CHARS
-    if total <= 0:
-        return aggregated
-    remaining = total
-    kept: list[dict[str, Any]] = []
-    for parent in aggregated:
-        content = str(parent.get("content", "") or "")
-        cost = len(content) if content else 0
-        if cost == 0:
+        try:
+            row_version = int(str(row.get("doc_version", "") or "").strip())
+            ref_version = int(str(ref.get("doc_version", "") or "").strip())
+        except (TypeError, ValueError):
+            version_mismatch_count += 1
             continue
-        if cost > remaining:
+        if row_version != ref_version:
+            version_mismatch_count += 1
+            continue
+        content = str(row.get("content", "") or "")
+        if not content.strip():
+            missing_parent_count += 1
+            continue
+
+        if per_doc_chars is not None:
+            content = _truncate_to_limit(content, per_doc_chars, len)
+        content = _truncate_to_limit(content, per_doc_tokens, measure)
+        content_tokens = measure(content)
+        content_chars = len(content)
+        if content_tokens > remaining_tokens:
             break
-        kept.append(parent)
-        remaining -= cost
-    return kept
+        if use_chars and content_chars > remaining_chars:
+            break
+
+        source = (
+            str(row.get("source_uri", "") or "")
+            or str(row.get("source_id", "") or "")
+            or str(row.get("source_type", "") or "")
+        )
+        parent = {
+            "id": parent_id,
+            "parent_id": parent_id,
+            "child_ids": list(ref.get("child_ids", [])),
+            "content": content,
+            "parent_title": row.get("title"),
+            "summary": row.get("summary"),
+            "source": source,
+            "source_type": row.get("source_type"),
+            "category": row.get("category"),
+            "tenant_id": context.tenant_id if context else ref.get("tenant_id"),
+            "kb_id": context.kb_id if context else ref.get("kb_id"),
+            "doc_version": row_version,
+            "content_sha256": row.get("content_sha256"),
+            "visibility": row.get("visibility"),
+            "score": ref.get("score"),
+            "ce_score": ref.get("ce_score"),
+        }
+        parents.append(parent)
+        remaining_tokens -= content_tokens
+        if use_chars:
+            remaining_chars -= content_chars
+
+    stats = {
+        "missing_parent_count": missing_parent_count,
+        "version_mismatch_count": version_mismatch_count,
+        "context_tokens": measure("".join(str(item.get("content", "")) for item in parents)),
+    }
+    return parents, stats
 
 
-__all__ = ["DEFAULT_MAX_CONTEXT_CHARS", "aggregate_parent_docs"]
+def filter_parent_refs(
+    refs: Sequence[dict[str, Any]],
+    parent_rows: Mapping[str, dict[str, Any]],
+    *,
+    context: Any,
+) -> list[dict[str, Any]]:
+    """Keep only refs whose authoritative parent row is current and usable."""
+    valid: list[dict[str, Any]] = []
+    for ref in refs:
+        parent_id = str(ref.get("parent_id", "") or "")
+        row = parent_rows.get(parent_id)
+        if not row:
+            continue
+        if context is not None and (
+            str(row.get("tenant_id", "") or "") != context.tenant_id
+            or str(row.get("kb_id", "") or "") != context.kb_id
+        ):
+            continue
+        try:
+            row_version = int(str(row.get("doc_version", "") or "").strip())
+            ref_version = int(str(ref.get("doc_version", "") or "").strip())
+        except (TypeError, ValueError):
+            continue
+        if row_version != ref_version or not str(row.get("content", "") or "").strip():
+            continue
+        valid.append(dict(ref))
+    return valid
+
+__all__ = [
+    "DEFAULT_MAX_CONTEXT_TOKENS",
+    "DEFAULT_MAX_DOC_TOKENS",
+    "assemble_parent_refs",
+    "build_parent_refs",
+    "default_token_counter",
+    "filter_parent_refs",
+    "validate_parent_refs",
+]

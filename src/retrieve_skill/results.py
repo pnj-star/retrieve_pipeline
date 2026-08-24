@@ -1,9 +1,9 @@
 
 """RAG 检索工具返回的结构化结果契约。
 
-status 枚举是契约中稳定的机器可读部分。``docs`` 始终存放经过管线保留的文档
-（在 ``no_context`` 场景下则为候选项），供 agent 编排层做多来源融合、复核或转人工。
-检索管道不生成回答，因此这里只有检索侧状态与结果。
+status 枚举是契约中稳定的机器可读部分。``docs`` 只携带通过精排阈值并完成
+父块聚合的上下文；低于阈值或精排器故障时一律不返回候选原文，避免低置信内容
+进入下游 LLM。检索管道不生成回答，因此这里只有检索侧状态与结果。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ class RetrieveStatus:
 
     检索管道只负责把"精排后达到相关性阈值的文档"交给 agent，不做回答生成。
         RETRIEVED: 正常检索到并精排后达到阈值。
-        RETRIEVED_CACHE: 命中检索缓存（query → 精排后达标文档）。
+        RETRIEVED_CACHE: 命中合格父块引用缓存并回源重建后的上下文。
         NO_CONTEXT: 检索为空 / 混合检索两边都空 / 精排后没有文档达到阈值。
         ERROR: 管线内部异常。
     """
@@ -30,12 +30,11 @@ class RetrieveStatus:
 
 @dataclass(slots=True)
 class RetrieveResult:
-    """检索管道结果：状态、精排后的候选文档、是否命中缓存。
+    """检索管道结果：状态、达标父块上下文、是否命中缓存与诊断信息。
 
-    ``docs`` 始终携带检索/精排后的候选文档（即使 ``status`` 为 ``no_context``，
-    便于调用方 agent 结合候选自行判断是否转人工）。是否达到阈值由 ``status``
-    表达：``retrieved`` / ``retrieved_cache`` 表示有达标文档可用，
-    ``no_context`` 表示没有达标文档。
+    ``docs`` 只在成功路径携带父块粒度文档；``no_context`` 和 ``error`` 路径
+    一律为空列表，防止未达标的子块被下游模型当作事实依据。诊断字段只保留
+    数量和分数等摘要，不携带候选正文。
     """
 
     status: str
@@ -43,6 +42,7 @@ class RetrieveResult:
     rewritten_query: str = ""
     cache_hit: bool = False
     message: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:

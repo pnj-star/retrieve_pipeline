@@ -19,7 +19,6 @@ from common_core.instrumentation import current_trace_id, trace_node
 from common_core.mcp_auth import ToolContextGuard, build_mcp_auth
 
 from .pipeline import RagPipeline
-from .parent_docs import aggregate_parent_docs
 from .results import RetrieveStatus
 
 logger = logging.getLogger(__name__)
@@ -158,7 +157,8 @@ def create_mcp_server(
         "若 AUTH_MODE=jwt 开启，HTTP 调用通过 Authorization Bearer 头传递 JWT，也可在工具参数里传 auth_token；"
         "其中 tenant_id / kb_id claims 需与请求参数一致。"
         "可选参数支持按集合检索（collection_name）、控制返回条数（top_k）、追加过滤（filter_expr）、"
-        "覆盖相关性阈值（min_relevance）与上下文预算（context_max_chars / max_doc_chars）。"
+        "覆盖相关性阈值（min_relevance）与上下文预算（context_max_tokens / max_doc_tokens、"
+        "context_max_chars / max_doc_chars）。"
         "可选传入上游 W3C traceparent 以串联分布式调用链路，"
         "响应会携带 trace_id 供日志与链路追踪关联排查。"
     ),
@@ -208,17 +208,17 @@ def create_mcp_server(
         query_rewrite_mode: str | None = None,
         rewrite_query: str | None = None,
         min_relevance: float | None = None,
+        context_max_tokens: int | None = None,
+        max_doc_tokens: int | None = None,
         context_max_chars: int | None = None,
         max_doc_chars: int | None = None,
     ) -> dict[str, Any]:
         """只检索租户范围内的文档，不生成回答。
 
-        走完整检索管道：检索缓存命中（query → 精排后达标文档）直接返回；
-        未命中则查询改写 → 混合检索（稀疏+稠密）→ RRF → 精排 → 阈值筛选，
-        达标文档回写检索缓存。返回父块粒度去重后的 ``docs``：同一父块的多个
-        命中子块合并成一个父块文档（含 ``child_ids`` 子块主键列表），并做
-        单篇与总量的预算截断，避免 top-k 子块把 agent 的上下文窗口打爆、
-        同时保留完整可读的整段依据。不做回答生成。
+            走完整检索管道：检索缓存命中后回源校验精排达标的父块引用；未命中则
+            查询改写 → 混合检索（稀疏+稠密）→ RRF → 精排 → 阈值筛选，达标子块
+            按 parent_id 去重后回写缓存。随后从权威父块存储批量加载正文，并做
+            单篇与总量的 token/字符预算截断。返回父块粒度 ``docs``，不做回答生成。
 
         Args:
             query: 用户原始问题文本。
@@ -239,8 +239,11 @@ def create_mcp_server(
                 不传则使用服务端配置默认值。
             rewrite_query: 显式传入改写后的查询文本；传了即跳过内部改写。
             min_relevance: 本次精排相关性阈值覆盖；不传用环境默认值。
-            context_max_chars: 合并后 docs 正文字符总预算；不传默认 8000。
-            max_doc_chars: 单篇父块正文上限；不传约为总预算一半。
+            min_relevance: 本次精排相关性阈值覆盖；不传用环境默认值。
+            context_max_tokens: 父块正文总 token 预算；不传默认 6000。
+            max_doc_tokens: 单篇父块正文 token 上限；不传约为总预算一半。
+            context_max_chars: 可选的父块正文字符总预算；与 token 预算同时生效。
+            max_doc_chars: 可选的单篇父块字符上限。
         """
         token = _transport_auth_token() or auth_token
         context = guard.resolve(
@@ -270,6 +273,10 @@ def create_mcp_server(
                     query_rewrite_mode=query_rewrite_mode,
                     rewrite_query=rewrite_query,
                     min_relevance=min_relevance,
+                    context_max_tokens=context_max_tokens,
+                    max_doc_tokens=max_doc_tokens,
+                    context_max_chars=context_max_chars,
+                    max_doc_chars=max_doc_chars,
                 )
         except Exception as exc:  # 管线异常转成稳定结构化契约，不把堆栈炸给调用方
             logger.exception(
@@ -297,27 +304,11 @@ def create_mcp_server(
                 "count": 0,
                 "docs": [],
                 "rewritten_query": query,
+                "diagnostics": {},
                 "trace_id": trace_id_value,
             }
         finally:
             telemetry.reset_context(trace_token)
-        # 默认上下文预算从运行时配置（.env RETRIEVAL_ASSEMBLY_MAX_CHARS）取；
-        # 调用方显式传 context_max_chars 时以请求参数为准。测试/直连注入的
-        # 轻量 pipeline 可能没有 runtime，此时交给 aggregate_parent_docs 的
-        # 内置默认值。
-        runtime = getattr(pipeline, "runtime", None)
-        default_context_chars = (
-            runtime.retrieval.assembly_max_context_chars
-            if runtime is not None and getattr(runtime, "retrieval", None) is not None
-            else None
-        )
-        docs = aggregate_parent_docs(
-            result.docs,
-            max_chars=context_max_chars
-            if context_max_chars is not None
-            else default_context_chars,
-            max_doc_chars=max_doc_chars,
-        )
         return {
             "ok": result.status != RetrieveStatus.ERROR,
             "status": result.status,
@@ -327,9 +318,10 @@ def create_mcp_server(
             "kb_id": context.kb_id,
             "request_id": context.request_id,
             "user_id": context.user_id,
-            "count": len(docs),
-            "docs": docs,
+            "count": len(result.docs),
+            "docs": result.docs,
             "rewritten_query": result.rewritten_query or query,
+            "diagnostics": result.diagnostics,
             "trace_id": trace_id_value,
         }
 

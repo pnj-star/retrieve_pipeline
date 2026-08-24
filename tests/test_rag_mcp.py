@@ -27,9 +27,16 @@ class FakePipeline:
         self.calls.append({"op": "retrieve_context", "query": query, "context": context, **kwargs})
         return RetrieveResult(
             RetrieveStatus.RETRIEVED,
-            docs=[{"content": "doc", "score": 0.9}],
+            docs=[{
+                "id": "parent-1",
+                "parent_id": "parent-1",
+                "child_ids": ["chunk-1"],
+                "content": "doc",
+                "score": 0.9,
+            }],
             rewritten_query=kwargs.get("rewrite_query") or query,
             message="ok",
+            diagnostics={"qualified_child_count": 1},
         )
 
 
@@ -122,6 +129,7 @@ def test_rag_retrieve_returns_structured_error_on_pipeline_exception() -> None:
     )
     payload = _payload(result)
     assert payload["ok"] is False
+    assert payload["diagnostics"] == {}
     assert payload["status"] == RetrieveStatus.ERROR
     assert payload["count"] == 0
     assert payload["docs"] == []
@@ -194,9 +202,10 @@ def test_rag_retrieve_accepts_traceparent_and_returns_trace_id() -> None:
     payload = _payload(result)
     assert payload["docs"][0]["content"] == "doc"
     assert "context_text" not in payload
-    assert "child_ids" in payload["docs"][0]
+    assert payload["docs"][0]["child_ids"] == ["chunk-1"]
     assert "trace_id" in payload
     assert payload["status"] == "retrieved"
+    assert payload["diagnostics"] == {"qualified_child_count": 1}
 
 
 def test_rag_retrieve_passes_scope_and_top_k() -> None:
@@ -282,8 +291,9 @@ class IdentityPipeline(FakePipeline):
             RetrieveStatus.RETRIEVED,
             docs=[
                 {
-                    "id": "chunk-42",
+                    "id": "parent-7",
                     "parent_id": "parent-7",
+                    "child_ids": ["chunk-42"],
                     "content": "doc",
                     "score": 0.9,
                 }
@@ -293,7 +303,7 @@ class IdentityPipeline(FakePipeline):
         )
 
 
-def test_rag_retrieve_exposes_chunk_identity_in_context() -> None:
+def test_rag_retrieve_exposes_parent_identity_in_context() -> None:
     server = create_mcp_server(pipeline=IdentityPipeline(), auth=AuthConfig(mode="disabled"))
     result = _run(
         server.call_tool(

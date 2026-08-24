@@ -1,11 +1,11 @@
 ---
 name: retrieve_skill
-description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent 需要基于知识库回答问题时，调用 rag_retrieve 获取达标文档用于生成回答；回答生成与护栏不属于本工具职责。提供租户隔离、混合检索、RRF 融合、交叉编码器精排与检索缓存。
+description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent 需要基于知识库回答问题时，调用 rag_retrieve 获取达标父块文档用于生成回答；回答生成与护栏不属于本工具职责。提供租户隔离、混合检索、RRF 融合、交叉编码器精排、MySQL 父块回源与检索缓存。
 ---
 
 # retrieve_skill
 
-`rag_retrieve` 是面向 agent 的检索工具。传入用户查询与租户上下文，返回按父块聚合、预算化、达到相关性阈值的 `docs`，供你用于回答生成或多来源融合。回答生成、护栏与低置信兜底由调用方 agent 完成，本工具不做。
+`rag_retrieve` 是面向 agent 的检索工具。传入用户查询与租户上下文，返回按父块聚合、预算化、达到相关性阈值的 `docs`；父块正文来自权威 MySQL 存储，供你用于回答生成或多来源融合。回答生成、护栏与低置信兜底由调用方 agent 完成，本工具不做。
 
 ## 什么时候用
 
@@ -17,7 +17,7 @@ description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent �
 
 必传参数：`query`、`tenant_id`、`kb_id`、`request_id`。
 
-可选参数：`auth_token`、`session_id`、`user_id`、`collection_name`、`top_k`、`filter_expr`、`min_relevance`、`context_max_chars`、`max_doc_chars`。
+可选参数：`auth_token`、`session_id`、`user_id`、`collection_name`、`top_k`、`filter_expr`、`min_relevance`、`context_max_tokens`、`max_doc_tokens`、`context_max_chars`、`max_doc_chars`。
 
 查询改写相关可选参数：
 
@@ -38,8 +38,8 @@ description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent �
 
 ```text
 query + tenant_id + kb_id + request_id
-→ 检索缓存检查（key: 规范化 query + 改写模式分桶，按 tenant/kb 隔离）
-   ├─ 命中 → status=retrieved_cache，直接返回缓存中精排后达标文档
+→ 检索缓存检查（v3 完整检索签名，父块引用结果；tenant/kb 由 Redis key 外层隔离）
+   ├─ 命中 → 校验父块引用与阈值 → MySQL 回源校验 → token/字符预算重建 → status=retrieved_cache
    └─ 未命中 → 继续
 → 查询改写（默认 off，可选 llm_rewrite / query_expansion）
    └─ 启用 → 用改写后 query / 扩展变体继续，实际检索文本见 rewritten_query
@@ -48,12 +48,15 @@ query + tenant_id + kb_id + request_id
    └─ 任一有结果 → 下一步
 → RRF 融合，得到候选文档
 → 交叉编码器精排，得到统一 relevance 分数
+   └─ 精排器故障 → status=error，docs=[]，不写缓存
 → 与 RETRIEVAL_MIN_RELEVANCE 比较
-   ├─ 没有文档过阈值 → status=no_context，结束
-   └─ 有文档过阈值 → 只保留达标文档 → 按父块聚合（含 child_ids）→ 预算截断 → 回写检索缓存 → status=retrieved
+   ├─ 没有子块过阈值 → status=no_context，docs=[]，不写缓存
+   └─ 有子块过阈值 → 子块去重 → 按 parent_id 去重并构建引用
+      → MySQL 批量回源父块 → 版本/状态校验 → 父块引用回写 Redis
+      → token/字符预算截断 → status=retrieved
 ```
 
-返回的 `rewritten_query` 是本次实际用于检索的查询文本：改冖关闭（`off`）时为原始 `query`，显式传 `rewrite_query` 时为其本身。
+返回的 `rewritten_query` 是本次实际用于检索的查询文本：改写关闭（`off`）时为原始 `query`，显式传 `rewrite_query` 时为其本身。
 
 ## 返回值
 
@@ -70,6 +73,7 @@ query + tenant_id + kb_id + request_id
   "request_id": "req-1",
   "user_id": "",
   "trace_id": "",
+  "diagnostics": {},
   "message": ""
 }
 ```
@@ -78,25 +82,27 @@ query + tenant_id + kb_id + request_id
 | --- | --- |
 | `status` | 机器可读状态码（权威信号），见下表 `status` 取值 |
 | `ok` | 是否无内部异常，等价于 `status != "error"` |
-| `docs` | 精排后的达标文档，按父块聚合去重（`no_context` 时为候选项） |
+| `docs` | 精排后达标且 MySQL 当前可用的父块上下文；`no_context` / `error` 时为空 |
 | `rewritten_query` | 本次实际用于检索的查询文本 |
 | `cache_hit` | 是否命中检索缓存，等价于 `status == "retrieved_cache"` |
 | `count` | 达标文档数量，等价于 `len(docs)` |
 | `tenant_id` / `kb_id` / `request_id` / `user_id` | 本次实际生效的调用上下文回显，用于确认鉴权作用域与日志/追踪关联 |
 | `trace_id` | 本次调用在追踪后端中的关联标识，供跨链路排障 |
+| `diagnostics` | 不含候选正文的检索摘要：原因、各级数量、缺失父块/版本冲突数、token 预算等 |
 | `message` | 状态的人类可读说明（如缓存命中 / no_context 原因） |
 
 `docs[*]` 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `id` | 父块主键（优先取 `parent_id`，缺失时回退到命中的子块 id）；据此回查父块/子块 |
+| `id` | 父块主键；来自 Milvus 子块 metadata 中的 `parent_id` |
 | `child_ids` | 该父块下所有命中子块的主键列表；供核对子块级召回 |
-| `parent_id` / `parent_title` | 父块主键 / 标题，可配（`MILVUS_OUTPUT_FIELDS`） |
-| `content` | 父块全文（同一父块多个命中子块合并去重后的整段依据），已做预算截断 |
-| `source` / `category` / `chunk_index` | 来源文件、分类、父块内首个命中子块序号 |
-| `ce_score` | 交叉编码器精排原始分数，裁剪到 `[0,1]` |
-| `score` | 精排后融合分 = `ce_weight*ce_score + retrieval_weight*retrieval_score`；聚合时取组内最高分 |
+| `parent_id` / `parent_title` | 父块主键 / MySQL 中的标题 |
+| `content` | MySQL 权威父块正文，已做 token/字符预算截断 |
+| `source` / `source_type` / `category` | MySQL 中保存的来源信息 |
+| `doc_version` | 命中时 MySQL 父块的当前版本 |
+| `ce_score` | 该父块下达标子块的最高交叉编码器分数 |
+| `score` | 对应最高分子块的融合检索分 |
 | `tenant_id` / `kb_id` | 命中文档所属作用域 |
 
 ## 按状态处理结果
@@ -104,22 +110,24 @@ query + tenant_id + kb_id + request_id
 | status | 含义 | 调用方行为建议 |
 | --- | --- | --- |
 | `retrieved` | 正常检索并精排后达到阈值 | 直接使用 `docs` 进入生成节点 |
-| `retrieved_cache` | 命中检索缓存（query → 精排后达标文档） | 直接复用 `docs` |
-| `no_context` | 检索为空或没有文档过相关性阈值 | `docs` 为候选；由你决定转人工、澄清问题或二次检索 |
+| `retrieved_cache` | 命中合格父块引用缓存并回源重建视图 | 直接复用 `docs` |
+| `no_context` | 检索为空或没有文档过相关性阈值 | `docs` 为空；由你决定转人工、澄清问题或二次检索 |
 | `error` | 管线内部异常 | 视为失败，重试或上报；用 `trace_id` / `request_id` 排障 |
 
 需要多来源融合（如再查 MySQL/NL2SQL）时，以 `docs` 里的父块文档作为依据，与外部数据统一交给生成节点；`child_ids` 只用于回查核对，不作为生成正文本体重复拼入。
 
 ## 缓存与成本
 
-- 检索缓存默认开启（Redis，`rag_retrieval` 命名空间）。同 query + tenant/kb 命中直接返回精排后达标文档，跳过改写、混合检索与精排，是省成本的关键。
+- 检索缓存默认开启（Redis，`rag_retrieval_cache_v3` 命名空间）。key 覆盖查询、改写语义、集合、top-k/RRF、过滤、阈值、embedding/reranker 配置、parent store 标识和数据版本；命中后跳过改写、混合检索与精排，但仍回源 MySQL。
+- Redis 缓存的是精排后达标的**父块引用**：`tenant_id`、`kb_id`、`parent_id`、`child_ids`、`ce_score`、`score`、`doc_version`，不保存父块正文。每次命中都会用 MySQL 当前正文和请求预算重建最终视图。
 - `no_context` 不写入缓存：无达标文档的结论不会缓存，知识库更新后的同类问题仍会重新检索。
 - 本工具不做回答缓存；回答缓存归属调用方编排层。
 
 ## 常见参数说明
 
-- `context_max_chars`: 合并后 `docs` 里正文的字符总预算，默认 `8000`。
-- `max_doc_chars`: 单篇父块文档正文上限，不传时默认约为整体预算的一半。
+- `context_max_tokens`: 所有父块正文的 token 总预算，默认 `6000`。
+- `max_doc_tokens`: 单篇父块正文 token 上限，不传时默认约为总预算一半。
+- `context_max_chars` / `max_doc_chars`: 可选字符预算；显式传入时会与 token 预算同时生效。
 - `filter_expr`: 附加的业务过滤表达式，会与租户 / 知识库隔离条件一起下发到向量库。
 
 ## 边界

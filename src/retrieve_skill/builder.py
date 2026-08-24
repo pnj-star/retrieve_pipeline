@@ -15,6 +15,7 @@ from common_core.observability import Observability
 from common_core.providers import RedisCache
 
 from .stages import Reranker, RetrievalCache
+from .parent_store import MySQLParentStore, ParentStoreConfig
 
 
 # 模型应尽量从本地 HuggingFace 缓存加载，避免首次推理去访问 HF_ENDPOINT
@@ -104,10 +105,10 @@ def build_retrieval_cache(
     metrics: Observability | None = None,
     **overrides: Any,
 ) -> RetrievalCache:
-    """构建租户隔离的检索缓存（query → 精排后达标文档），复用底层 Redis 连接。
+    """构建租户隔离的检索缓存（完整检索签名 → 精排达标父块引用）。
 
-    检索缓存（``rag_retrieval``）只负责检索侧：命中时直接复用精排后文档，
-    跳过改写、混合检索与精排。
+    检索缓存只保存通过质量门禁的轻量父块引用；父块正文、版本校验、展示
+    投影与 token 预算由 pipeline 在每次读取后回源 MySQL 确定性重建。
 
     参数:
         runtime: 运行时配置；None 时从环境构建。
@@ -152,6 +153,11 @@ def build_pipeline(
     from .pipeline import RagPipeline
 
     kwargs = dict(overrides)
+    # ParentStore 连接池是惰性创建的；只调用 retrieve() 时不会连 MySQL。
+    kwargs.setdefault(
+        "parent_store",
+        MySQLParentStore(ParentStoreConfig.from_env()),
+    )
     if include_defaults:
         default_cache = build_cache(runtime)
         kwargs.setdefault("cache", default_cache)
@@ -166,5 +172,6 @@ def build_pipeline(
     return RagPipeline(
         runtime=runtime,
         metrics=metrics,
+        data_version=os.getenv("KNOWLEDGE_DATA_VERSION"),
         **kwargs,
     )

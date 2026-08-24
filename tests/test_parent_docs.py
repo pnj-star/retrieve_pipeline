@@ -1,84 +1,149 @@
-"""父块聚合模块的单测：多子块合并、child_ids、预算截断。"""
+"""Parent reference grouping, validation, and authoritative assembly tests."""
 
 from __future__ import annotations
 
-from retrieve_skill.parent_docs import aggregate_parent_docs
+from common_core.context import AgentContext
+
+from retrieve_skill.parent_docs import (
+    assemble_parent_refs,
+    build_parent_refs,
+    filter_parent_refs,
+    validate_parent_refs,
+)
 
 
 def _child(
-    id: str,
+    child_id: str,
+    parent_id: str,
     *,
-    parent_id: str = "",
-    content: str = "text",
-    chunk_index: int = 0,
-    source: str = "a.md",
-    tenant: str = "t",
-    kb: str = "k",
-    score: float | None = None,
-):
-    doc = {
-        "id": id,
+    ce_score: float,
+    score: float = 0.8,
+    doc_version: int = 1,
+) -> dict:
+    return {
+        "id": child_id,
+        "content": f"{child_id} text",
         "parent_id": parent_id,
-        "content": content,
-        "chunk_index": chunk_index,
-        "source": source,
-        "tenant_id": tenant,
-        "kb_id": kb,
+        "tenant_id": "t1",
+        "kb_id": "kb1",
+        "doc_version": doc_version,
+        "score": score,
+        "ce_score": ce_score,
     }
-    if score is not None:
-        doc["score"] = score
-    return doc
 
 
-def test_same_parent_children_merge_into_one_doc():
-    docs = [
-        _child("c1", parent_id="p1", content="first", chunk_index=0, score=0.9),
-        _child("c2", parent_id="p1", content="second", chunk_index=1, score=0.7),
-        _child("c3", parent_id="p2", content="other", chunk_index=0, score=0.5),
+def _context() -> AgentContext:
+    return AgentContext(tenant_id="t1", kb_id="kb1")
+
+
+def test_build_parent_refs_groups_and_ranks_parents() -> None:
+    refs = build_parent_refs([
+        _child("c1", "p2", ce_score=0.7),
+        _child("c2", "p1", ce_score=0.95),
+        _child("c3", "p1", ce_score=0.9),
+        _child("c4", "", ce_score=0.99),
+    ])
+
+    assert [ref["parent_id"] for ref in refs] == ["p1", "p2"]
+    assert refs[0]["child_ids"] == ["c2", "c3"]
+    assert refs[0]["ce_score"] == 0.95
+    assert refs[0]["doc_version"] == 1
+    assert all("content" not in ref for ref in refs)
+    assert all("chunk_indexes" not in ref for ref in refs)
+    assert all("best_child_id" not in ref for ref in refs)
+
+
+def test_validate_parent_refs_enforces_threshold_and_scope() -> None:
+    valid = build_parent_refs([_child("c1", "p1", ce_score=0.9)])
+    assert validate_parent_refs(valid, threshold=0.8, context=_context()) == [
+        {
+            "tenant_id": "t1",
+            "kb_id": "kb1",
+            "parent_id": "p1",
+            "child_ids": ["c1"],
+            "ce_score": 0.9,
+            "score": 0.8,
+            "doc_version": 1,
+        }
     ]
-    result = aggregate_parent_docs(docs)
-    assert [d["id"] for d in result] == ["p1", "p2"]
-    p1 = result[0]
-    assert p1["child_ids"] == ["c1", "c2"]
-    assert p1["score"] == 0.9
-    assert "first" in p1["content"]
-    assert "second" in p1["content"]
+
+    below = build_parent_refs([_child("c1", "p1", ce_score=0.7)])
+    assert validate_parent_refs(below, threshold=0.8, context=_context()) is None
+
+    other_kb = [dict(valid[0], kb_id="other")]
+    assert validate_parent_refs(other_kb, threshold=0.8, context=_context()) is None
 
 
-def test_children_merge_in_chunk_index_order():
-    docs = [
-        _child("c2", parent_id="p", content="second", chunk_index=1),
-        _child("c1", parent_id="p", content="first", chunk_index=0),
+def test_assemble_parent_refs_checks_version_and_budget() -> None:
+    ref = {
+        "tenant_id": "t1",
+        "kb_id": "kb1",
+        "parent_id": "p1",
+        "child_ids": ["c1", "c2"],
+        "ce_score": 0.9,
+        "score": 0.8,
+        "doc_version": 2,
+    }
+    rows = {
+        "p1": {
+            "tenant_id": "t1",
+            "kb_id": "kb1",
+            "title": "title",
+            "content": "a" * 100,
+            "doc_version": 2,
+        },
+        "stale": {
+            "tenant_id": "t1",
+            "kb_id": "kb1",
+            "content": "old",
+            "doc_version": 1,
+        },
+    }
+    parents, stats = assemble_parent_refs(
+        [ref],
+        rows,
+        context=_context(),
+        count_tokens=len,
+        context_max_tokens=50,
+        max_doc_tokens=30,
+    )
+
+    assert len(parents) == 1
+    assert parents[0]["id"] == "p1"
+    assert parents[0]["child_ids"] == ["c1", "c2"]
+    assert "[truncated]" in parents[0]["content"]
+    assert stats["context_tokens"] <= 50
+
+    stale_ref = dict(ref, parent_id="stale")
+    stale_parents, stale_stats = assemble_parent_refs(
+        [stale_ref],
+        rows,
+        context=_context(),
+        count_tokens=len,
+    )
+    assert stale_parents == []
+    assert stale_stats["version_mismatch_count"] == 1
+
+
+def test_filter_parent_refs_keeps_current_rows_only() -> None:
+    refs = [
+        {"parent_id": "current", "doc_version": 2},
+        {"parent_id": "missing", "doc_version": 1},
+        {"parent_id": "stale", "doc_version": 1},
     ]
-    result = aggregate_parent_docs(docs)
-    assert result[0]["content"] == "first\n\nsecond"
-
-
-def test_doc_without_parent_id_becomes_own_parent():
-    result = aggregate_parent_docs([_child("c1", content="solo", source="b.md")])
-    assert len(result) == 1
-    assert result[0]["id"] == "c1"
-    assert result[0]["child_ids"] == ["c1"]
-
-
-def test_total_budget_truncates_later_docs():
-    docs = [
-        _child("c1", parent_id="p1", content="a" * 100),
-        _child("c2", parent_id="p2", content="b" * 100),
-        _child("c3", parent_id="p3", content="c" * 100),
-    ]
-    result = aggregate_parent_docs(docs, max_chars=120)
-    # 每篇被截到总量一半（60），三篇里只有前两篇能放进 120 的总预算。
-    assert [d["id"] for d in result] == ["p1", "p2"]
-    assert result[0]["id"] == "p1"
-
-
-def test_per_doc_budget_truncates_single_long_parent():
-    docs = [_child("c1", parent_id="p1", content="a" * 100)]
-    result = aggregate_parent_docs(docs, max_doc_chars=20)
-    assert len(result) == 1
-    assert len(result[0]["content"]) <= 20
-
-
-def test_empty_input_returns_empty():
-    assert aggregate_parent_docs([]) == []
+    rows = {
+        "current": {
+            "tenant_id": "t1",
+            "kb_id": "kb1",
+            "content": "ok",
+            "doc_version": 2,
+        },
+        "stale": {
+            "tenant_id": "t1",
+            "kb_id": "kb1",
+            "content": "ok",
+            "doc_version": 3,
+        },
+    }
+    filtered = filter_parent_refs(refs, rows, context=_context())
+    assert [ref["parent_id"] for ref in filtered] == ["current"]
