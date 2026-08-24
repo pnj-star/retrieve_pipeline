@@ -25,7 +25,6 @@ from common_core.instrumentation import trace_node
 from common_core.observability import Observability
 from common_core.providers import LocalEmbedder, MilvusVectorStore, OpenAICompatibleLLM, RedisCache
 from common_core.providers.vector import build_filter_expr
-
 from .parent_docs import (
     assemble_parent_refs,
     build_parent_refs,

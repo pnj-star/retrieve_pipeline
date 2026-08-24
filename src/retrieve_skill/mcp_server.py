@@ -239,11 +239,17 @@ def create_mcp_server(
                 不传则使用服务端配置默认值。
             rewrite_query: 显式传入改写后的查询文本；传了即跳过内部改写。
             min_relevance: 本次精排相关性阈值覆盖；不传用环境默认值。
-            min_relevance: 本次精排相关性阈值覆盖；不传用环境默认值。
             context_max_tokens: 父块正文总 token 预算；不传默认 6000。
             max_doc_tokens: 单篇父块正文 token 上限；不传约为总预算一半。
             context_max_chars: 可选的父块正文字符总预算；与 token 预算同时生效。
             max_doc_chars: 可选的单篇父块字符上限。
+
+        Returns:
+            结构化字典：ok 表示没有内部异常；status 区分 retrieved /
+            retrieved_cache / no_context / error；docs 是父块粒度最终上下文，
+            每项通常含 id/parent_id、content、child_ids、score、ce_score、
+            tenant_id、kb_id 和 doc_version。count 等于 len(docs)；
+            diagnostics 提供数量级摘要；trace_id 用于串联日志。
         """
         token = _transport_auth_token() or auth_token
         context = guard.resolve(

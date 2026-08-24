@@ -1,4 +1,4 @@
-"""Parent reference grouping, validation, and authoritative assembly tests."""
+"""父块引用分组、缓存校验与权威内容组装的契约测试。"""
 
 from __future__ import annotations
 

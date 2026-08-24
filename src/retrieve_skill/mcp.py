@@ -79,7 +79,7 @@ def _build_runtime(env_file: str | None) -> tuple[Any, str]:
     if resolved:
         load_env_files(resolved)
     runtime = RuntimeConfig.from_env()
-    # retrieve_skill needs a local embedding model for dense retrieval.
+    # 稠密检索必须依赖本地 embedding 模型生成查询向量。
     # LLM 三件套只在查询改写实际启用 LLM 模式时才要求，off 环境可留空。
     runtime.validate(require_embedding=True, require_llm=False)
     source = "env:" + resolved if resolved else "process-env"

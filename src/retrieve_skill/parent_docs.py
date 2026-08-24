@@ -17,7 +17,18 @@ _TOKEN_ENCODINGS: dict[str, Any] = {}
 
 
 def default_token_counter(text: str) -> int:
-    """Count tokens with tiktoken; callers can inject a model-specific counter."""
+    """用 tiktoken 计算文本 token 数。
+
+    参数:
+        text: 待计数的任意文本；None 会先转成空字符串。
+
+    返回:
+        token 数量。编码器按 CONTEXT_TOKEN_ENCODING 配置选择，
+        默认 cl100k_base；同一编码会进程内缓存，避免重复构建。
+
+    说明:
+        如果目标模型有专用 tokenizer，可在 pipeline 中注入 count_tokens 覆盖本函数。
+    """
     import tiktoken
 
     encoding_name = os.getenv("CONTEXT_TOKEN_ENCODING", "cl100k_base")
@@ -29,10 +40,26 @@ def default_token_counter(text: str) -> int:
 
 
 def build_parent_refs(docs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group qualified children into ranked parent references.
+    """把精排达标的子块聚合成带排序信息的轻量父块引用。
 
-    The reference list is the only retrieval result stored in Redis. Parent
-    text is intentionally omitted so MySQL remains the authoritative source.
+    处理流程:
+    1. 忽略没有 parent_id 的异常子块；
+    2. 用 tenant_id + kb_id + parent_id 作为分组键，避免不同作用域同名 ID 串数据；
+    3. 同一父块下收集 child_ids，并保留最高 ce_score 和最高粗检索 score；
+    4. 先按首次出现顺序稳定建组，最后按精排分、检索分和 parent_id 排序。
+
+    参数:
+        docs: 已经通过相关性阈值的子块文档序列。每个文档必须能读取
+            parent_id 和 ce_score，通常还带有 id、tenant_id、kb_id、score、doc_version。
+
+    返回:
+        父块引用列表。每项包含 tenant_id、kb_id、parent_id、child_ids、ce_score、
+        score 和 doc_version；故意不包含正文，保证 Redis 只存轻量引用，
+        MySQL 始终是父块正文的唯一权威来源。
+
+    异常:
+        KeyError: 文档缺少 ce_score 字段。
+        ValueError/TypeError: 分数字段无法转成 float。
     """
     grouped: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -62,6 +89,8 @@ def build_parent_refs(docs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         ce_score = float(doc["ce_score"])
         score = float(doc.get("score", 0.0) or 0.0)
         group["child_ids"].append(child_id)
+        # ce_score 相同只是保持最后一次读到的版本；正常情况下同组子块来自
+        # 同一父块快照。这里不引入额外排序规则，避免改变既有行为。
         if ce_score == group["ce_score"]:
             group["doc_version"] = doc.get("doc_version")
         group["ce_score"] = max(float(group["ce_score"]), ce_score)
@@ -88,7 +117,21 @@ def validate_parent_refs(
     threshold: float,
     context: Any | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Validate cached parent references; invalid data is treated as a miss."""
+    """校验缓存中的父块引用；任何结构或质量异常都视为缓存未命中。
+
+    校验内容包括：整体必须是列表、每一项必须是字典且字段类型合法、
+    parent_id 不重复、child_ids 非空且无重复、ce_score 在阈值内且为有限数值、
+    doc_version 可以转成整数；传入 context 时还会校验租户/知识库一致。
+
+    参数:
+        docs: Redis 反序列化得到的候选父块引用，可能是损坏或过期结构。
+        threshold: 本次请求使用的最低精排相关性阈值。
+        context: agent 上下文；非空时用于强制校验 tenant_id 和 kb_id。
+
+    返回:
+        校验通过并归一化后的引用列表；任何一项无效则整体返回 None，
+        让上层把它当作缓存 miss 并走完整检索，而不是带着可疑数据继续。
+    """
     if not isinstance(docs, list) or not docs:
         return None
     validated: list[dict[str, Any]] = []
@@ -149,7 +192,19 @@ def _truncate_to_limit(
     limit: int,
     measure: Callable[[str], int],
 ) -> str:
-    """Keep the longest prefix that fits the measured budget."""
+    """截断文本，保留不超过测量预算的最长前缀。
+
+    使用二分查找而不是逐字符缩短，避免长父块在每次请求中被大量重复计数。
+    当预算足够容纳截断标记时会追加 " [truncated]"；预算极小时返回空字符串。
+
+    参数:
+        text: 原始文本。
+        limit: 最大允许长度，单位由 measure 决定（通常是 token 或字符）。
+        measure: 长度测量函数，输入文本并返回非负数量，例如 token 计数器或 len。
+
+    返回:
+        不超过 limit 的截断后文本。limit <= 0 或原文本为空时返回空字符串。
+    """
     if limit <= 0 or not text:
         return ""
     if measure(text) <= limit:
@@ -186,7 +241,29 @@ def assemble_parent_refs(
     context_max_chars: int | None = None,
     max_doc_chars: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Hydrate parent refs and apply token and optional character budgets."""
+    """回源后的父块引用组装成展示上下文，并应用 token/字符预算。
+
+    处理流程:
+    1. 按排序后的 refs 顺序查找权威父块行；缺失、跨租户、版本不一致或正文为空
+       的引用都会被跳过并计入诊断统计；
+    2. 每篇父块先做可选字符上限截断，再做 token 上限截断；
+    3. 若当前父块会超过上下文总预算，停止继续添加后续父块；
+    4. 输出回答侧可直接使用的父块视图和数量/token 统计。
+
+    参数:
+        refs: 已通过过滤的轻量父块引用，顺序代表最终优先级。
+        parent_rows: MySQL 回源结果，key 是 parent_id，value 是父块字段字典。
+        context: agent 上下文，用于再次确认父块所属租户和知识库。
+        count_tokens: 自定义 token 计数函数；None 用默认 tiktoken 计数器。
+        context_max_tokens: 所有父块正文的总 token 预算；None 用默认 6000。
+        max_doc_tokens: 单篇父块 token 上限；None 或 <=0 时默认取总预算的一半。
+        context_max_chars: 所有父块正文的总字符预算；None 表示不启用字符总量限制。
+        max_doc_chars: 单篇父块字符上限；None 或 <=0 表示不启用单篇字符限制。
+
+    返回:
+        (parents, stats) 二元组。parents 是可直接给 agent/LLM 的父块文档列表；
+        stats 包含 missing_parent_count、version_mismatch_count 和实际 content token 总量。
+    """
     measure = count_tokens or default_token_counter
     token_budget = (
         context_max_tokens
@@ -289,7 +366,21 @@ def filter_parent_refs(
     *,
     context: Any,
 ) -> list[dict[str, Any]]:
-    """Keep only refs whose authoritative parent row is current and usable."""
+    """只保留权威父块仍然存在、版本一致且可用的引用。
+
+    该方法用于回写 Redis 前清理失效数据。判断条件和最终组装保持一致：
+    父块必须存在于 parent_rows、属于当前租户/知识库、doc_version 与缓存引用一致，
+    并且正文不为空。
+
+    参数:
+        refs: 待过滤的父块引用序列。
+        parent_rows: 批量回源得到的父块字典。
+        context: agent 上下文；非空时用于租户和知识库一致性检查。
+
+    返回:
+        仍可使用的父块引用浅拷贝列表。顺序与入参 refs 保持一致，
+        方便调用方直接替换旧缓存。
+    """
     valid: list[dict[str, Any]] = []
     for ref in refs:
         parent_id = str(ref.get("parent_id", "") or "")

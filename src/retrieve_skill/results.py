@@ -35,6 +35,14 @@ class RetrieveResult:
     ``docs`` 只在成功路径携带父块粒度文档；``no_context`` 和 ``error`` 路径
     一律为空列表，防止未达标的子块被下游模型当作事实依据。诊断字段只保留
     数量和分数等摘要，不携带候选正文。
+
+    字段:
+        status: 机器可读状态，取值见 RetrieveStatus。
+        docs: 最终父块上下文；成功时非空，失败或无相关内容时为空。
+        rewritten_query: 实际用于检索的查询；未改写时等于原始 query。
+        cache_hit: 是否命中父块引用缓存。命中后仍会回源 MySQL 校验正文和版本。
+        message: 给人和日志看的简短状态说明。
+        diagnostics: 数量、分数、缺失原因等排障摘要；不包含候选正文。
     """
 
     status: str
