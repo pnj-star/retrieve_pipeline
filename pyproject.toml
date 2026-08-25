@@ -5,6 +5,7 @@ description = "Reusable retrieval pipeline skill built on common_core providers.
 requires-python = ">=3.11"
 dependencies = [
   "common-core[llm,vector,cache] @ git+https://github.com/pnj-star/common_core.git",
+  "tiktoken>=0.8",
 ]
 
 [project.optional-dependencies]

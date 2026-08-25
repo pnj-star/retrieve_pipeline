@@ -91,7 +91,7 @@ class RetrievalCache:
         try:
             docs = json.loads(raw)
         except (TypeError, ValueError) as exc:
-            logger.debug("retrieval cache value unparsable, ignoring: %s", exc)
+            logger.debug("检索缓存值无法解析，已忽略: %s", exc)
             return None
         if self.metrics is not None:
             self.metrics.record_cache(

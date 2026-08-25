@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PARENT_FIELDS = (
+    "tenant_id",
+    "kb_id",
     "parent_id",
     "title",
     "content",
@@ -32,6 +34,7 @@ _PARENT_FIELDS = (
     "source_id",
     "source_uri",
     "visibility",
+    "status",
     "doc_version",
     "content_sha256",
 )

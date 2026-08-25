@@ -191,7 +191,7 @@ class QueryRewriter:
         返回:
             归一化后的合法改写模式。
         """
-        explicit = normalize_query_rewrite_mode(requested_mode, default=self.config.mode)
+        explicit = normalize_query_rewrite_mode(requested_mode, default=self.config.mode)  # todo
         if requested_mode is not None:
             return explicit
         if context is not None and self.config.scoped_modes:

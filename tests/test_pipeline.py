@@ -204,6 +204,7 @@ def make_pipeline(
         metrics=metrics,
         default_output_fields=default_output_fields,
         parent_store=parent_store or FakeParentStore(),
+        count_tokens=len,
     )
 
 
