@@ -623,8 +623,8 @@ def test_cached_children_support_different_budgets_and_projections() -> None:
         pipeline.retrieve_context(
             "query",
             ctx,
-            context_max_chars=1000,
-            max_doc_chars=1000,
+            context_max_tokens=200,
+            max_doc_tokens=200,
             output_fields=("id", "content", "child_ids"),
         )
     )
@@ -636,8 +636,8 @@ def test_cached_children_support_different_budgets_and_projections() -> None:
         pipeline.retrieve_context(
             "query",
             ctx,
-            context_max_chars=40,
-            max_doc_chars=25,
+            context_max_tokens=12,
+            max_doc_tokens=8,
             output_fields=("id", "content"),
         )
     )

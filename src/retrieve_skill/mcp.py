@@ -168,33 +168,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-def serve_default(
-    *,
-    transport: str = "streamable-http",
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    path: str = "/streamable",
-) -> None:
-    """直接启动默认 MCP 服务，供 IDE 一键运行 / 本机调试。
-
-    不解析命令行参数，写死默认传输方式与端点，方便在 PyCharm 里以脚本方式
-    （Script path）一键运行即启动 streamable-http。生产 / 复用场景仍走
-    ``main()`` 的 CLI 参数（``python -m retrieve_skill.mcp``）。同样会先加载
-    .env 并校验配置，保证 Milvus / Redis / Embedding 与 CLI 启动一致。
-    """
-    runtime, config_source = _build_runtime(None)
-    metrics = Observability(runtime.metrics)
-    metrics.start_server()
-    server = create_mcp_server(
-        host=host,
-        port=port,
-        streamable_path=path,
-        sse_path="/sse",
-        metrics=metrics,
-        runtime=runtime,
-        config_source=config_source,
-    )
-    _run_server(server, transport)
-
-
-__all__ = ["create_mcp_server", "main", "serve_default"]
+__all__ = ["create_mcp_server", "main"]

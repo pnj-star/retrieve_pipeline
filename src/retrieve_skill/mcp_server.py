@@ -157,8 +157,7 @@ def create_mcp_server(
         "若 AUTH_MODE=jwt 开启，HTTP 调用通过 Authorization Bearer 头传递 JWT，也可在工具参数里传 auth_token；"
         "其中 tenant_id / kb_id claims 需与请求参数一致。"
         "可选参数支持按集合检索（collection_name）、控制返回条数（top_k）、追加过滤（filter_expr）、"
-        "覆盖相关性阈值（min_relevance）与上下文预算（context_max_tokens / max_doc_tokens、"
-        "context_max_chars / max_doc_chars）。"
+        "覆盖相关性阈值（min_relevance）与上下文预算（context_max_tokens / max_doc_tokens）。"
         "可选传入上游 W3C traceparent 以串联分布式调用链路，"
         "响应会携带 trace_id 供日志与链路追踪关联排查。"
     ),
@@ -210,15 +209,13 @@ def create_mcp_server(
         min_relevance: float | None = None,
         context_max_tokens: int | None = None,
         max_doc_tokens: int | None = None,
-        context_max_chars: int | None = None,
-        max_doc_chars: int | None = None,
     ) -> dict[str, Any]:
         """只检索租户范围内的文档，不生成回答。
 
             走完整检索管道：检索缓存命中后回源校验精排达标的父块引用；未命中则
             查询改写 → 混合检索（稀疏+稠密）→ RRF → 精排 → 阈值筛选，达标子块
             按 parent_id 去重后回写缓存。随后从权威父块存储批量加载正文，并做
-            单篇与总量的 token/字符预算截断。返回父块粒度 ``docs``，不做回答生成。
+            单篇与总量的 token 预算截断。返回父块粒度 ``docs``，不做回答生成。
 
         Args:
             query: 用户原始问题文本。
@@ -236,13 +233,11 @@ def create_mcp_server(
                 "off" — 问题简短明确，不做改写；
                 "llm_rewrite" — 问题口语化或有省略指代，LLM 改写成规范检索查询；
                 "query_expansion" — 一句话含多个子问题或话题宽泛，LLM 生成多条变体分别检索后合并提升召回。
-                不传则使用服务端配置默认值。
+                不传则使用服务端配置默认值；无效值按 "off" 处理。
             rewrite_query: 显式传入改写后的查询文本；传了即跳过内部改写。
             min_relevance: 本次精排相关性阈值覆盖；不传用环境默认值。
             context_max_tokens: 父块正文总 token 预算；不传默认 6000。
             max_doc_tokens: 单篇父块正文 token 上限；不传约为总预算一半。
-            context_max_chars: 可选的父块正文字符总预算；与 token 预算同时生效。
-            max_doc_chars: 可选的单篇父块字符上限。
 
         Returns:
             结构化字典：ok 表示没有内部异常；status 区分 retrieved /
@@ -281,8 +276,6 @@ def create_mcp_server(
                     min_relevance=min_relevance,
                     context_max_tokens=context_max_tokens,
                     max_doc_tokens=max_doc_tokens,
-                    context_max_chars=context_max_chars,
-                    max_doc_chars=max_doc_chars,
                 )
         except Exception as exc:  # 管线异常转成稳定结构化契约，不把堆栈炸给调用方
             logger.exception(

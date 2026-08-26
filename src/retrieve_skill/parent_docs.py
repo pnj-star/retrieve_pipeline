@@ -238,15 +238,13 @@ def assemble_parent_refs(
     count_tokens: Callable[[str], int] | None = None,
     context_max_tokens: int | None = None,
     max_doc_tokens: int | None = None,
-    context_max_chars: int | None = None,
-    max_doc_chars: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """回源后的父块引用组装成展示上下文，并应用 token/字符预算。
+    """回源后的父块引用组装成展示上下文，并应用 token 预算。
 
     处理流程:
     1. 按排序后的 refs 顺序查找权威父块行；缺失、跨租户、版本不一致或正文为空
        的引用都会被跳过并计入诊断统计；
-    2. 每篇父块先做可选字符上限截断，再做 token 上限截断；
+    2. 每篇父块先按单篇 token 上限截断；
     3. 若当前父块会超过上下文总预算，停止继续添加后续父块；
     4. 输出回答侧可直接使用的父块视图和数量/token 统计。
 
@@ -257,8 +255,6 @@ def assemble_parent_refs(
         count_tokens: 自定义 token 计数函数；None 用默认 tiktoken 计数器。
         context_max_tokens: 所有父块正文的总 token 预算；None 用默认 6000。
         max_doc_tokens: 单篇父块 token 上限；None 或 <=0 时默认取总预算的一半。
-        context_max_chars: 所有父块正文的总字符预算；None 表示不启用字符总量限制。
-        max_doc_chars: 单篇父块字符上限；None 或 <=0 表示不启用单篇字符限制。
 
     返回:
         (parents, stats) 二元组。parents 是可直接给 agent/LLM 的父块文档列表；
@@ -275,19 +271,11 @@ def assemble_parent_refs(
         if max_doc_tokens is not None and max_doc_tokens > 0
         else max(1, token_budget // 2)
     )
-    use_chars = context_max_chars is not None
-    char_budget = context_max_chars if use_chars else 0
-    per_doc_chars = (
-        max(1, max_doc_chars)
-        if max_doc_chars is not None and max_doc_chars > 0
-        else None
-    )
 
     parents: list[dict[str, Any]] = []
     missing_parent_count = 0
     version_mismatch_count = 0
     remaining_tokens = token_budget
-    remaining_chars = char_budget
     for ref in refs:
         parent_id = str(ref.get("parent_id", "") or "")
         row = parent_rows.get(parent_id)
@@ -314,14 +302,9 @@ def assemble_parent_refs(
             missing_parent_count += 1
             continue
 
-        if per_doc_chars is not None:
-            content = _truncate_to_limit(content, per_doc_chars, len)
         content = _truncate_to_limit(content, per_doc_tokens, measure)
         content_tokens = measure(content)
-        content_chars = len(content)
         if content_tokens > remaining_tokens:
-            break
-        if use_chars and content_chars > remaining_chars:
             break
 
         source = (
@@ -349,8 +332,6 @@ def assemble_parent_refs(
         }
         parents.append(parent)
         remaining_tokens -= content_tokens
-        if use_chars:
-            remaining_chars -= content_chars
 
     stats = {
         "missing_parent_count": missing_parent_count,

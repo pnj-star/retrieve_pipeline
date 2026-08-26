@@ -43,6 +43,13 @@ def test_normalize_mode_defaults_to_off() -> None:
     assert normalize_query_rewrite_mode("bogus") == "off"
 
 
+def test_explicit_invalid_mode_falls_back_to_off() -> None:
+    rewriter = QueryRewriter(FakeLLM(), QueryRewriteConfig(mode="llm_rewrite"))
+    assert rewriter.resolve_mode(make_context(), requested_mode="bogus") == "off"
+    assert rewriter.resolve_mode(make_context(), requested_mode="identity") == "off"
+    assert rewriter.resolve_mode(make_context(), requested_mode="") == "off"
+
+
 def test_off_returns_original_query() -> None:
     for mode in ("off",):
         rewriter = QueryRewriter(FakeLLM(), QueryRewriteConfig(mode=mode))

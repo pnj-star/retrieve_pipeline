@@ -242,8 +242,8 @@ def test_rag_retrieve_accepts_budget_params() -> None:
                 "tenant_id": "t4",
                 "kb_id": "kb4",
                 "request_id": "r4",
-                "context_max_chars": 200,
-                "max_doc_chars": 300,
+                "context_max_tokens": 200,
+                "max_doc_tokens": 300,
             },
         )
     )

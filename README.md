@@ -9,8 +9,8 @@
 - 租户 / 知识库隔离的混合检索（稀疏 + 稠密）。
 - RRF 融合、交叉编码器精排、相关性阈值判断。
 - 检索缓存：完整检索签名 → 精排达标子块对应的父块引用；低于阈值、reranker 或父块存储失败不写缓存。
-- 查询改写（`off` / `identity` / `llm_rewrite` / `query_expansion`）。
-- 子块按 `parent_id` 去重聚合；MySQL 批量回源权威父块正文后做 token/字符预算截断。
+- 查询改写（`off` / `llm_rewrite` / `query_expansion`），也支持调用方显式传入已改写查询。
+- 子块按 `parent_id` 去重聚合；MySQL 批量回源权威父块正文后做 token 预算截断。
 
 ## 文件布局
 
@@ -60,7 +60,7 @@ print(result.status, result.docs)
 - `RAG_PARENT_TABLE` / `RAG_PARENT_STATUS`: 父块表名和可见状态过滤，默认 `rag_parent_block` / `active`。
 - `CONTEXT_MAX_TOKENS` / `MAX_DOC_TOKENS`: 父块上下文总预算与单篇预算；调用方也可在每次请求覆盖。
 - `RETRIEVAL_TOP_K` / `RETRIEVAL_MIN_RELEVANCE` / `RETRIEVAL_RRF_TOP_K` / `RETRIEVAL_RRF_K`: 检索与精排阈值参数。
-- `RETRIEVAL_QUERY_REWRITE_MODE`: 查询改写策略，默认 `off`；可选 `off` / `identity` / `llm_rewrite` / `query_expansion`。
+- `RETRIEVAL_QUERY_REWRITE_MODE`: 查询改写策略，默认 `off`；可选 `off` / `llm_rewrite` / `query_expansion`。调用方显式传入 `rewrite_query` 时会跳过内部 LLM 改写。
 - `RETRIEVAL_QUERY_REWRITE_LLM_MODEL`: 改写专用模型，为空则复用管线 LLM。
 - `RETRIEVAL_QUERY_REWRITE_TEMPERATURE` / `RETRIEVAL_QUERY_REWRITE_MAX_TOKENS`: 改写调用参数。
 - `RETRIEVAL_QUERY_REWRITE_EXPAND_COUNT`: `query_expansion` 生成的扩展变体数量，默认 `2`。

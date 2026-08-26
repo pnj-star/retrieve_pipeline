@@ -191,9 +191,9 @@ class QueryRewriter:
         返回:
             归一化后的合法改写模式。
         """
-        explicit = normalize_query_rewrite_mode(requested_mode, default=self.config.mode)  # todo
         if requested_mode is not None:
-            return explicit
+            # Explicit caller input must not escalate to a server-side LLM mode.
+            return normalize_query_rewrite_mode(requested_mode, default="off")
         if context is not None and self.config.scoped_modes:
             candidates = (
                 f"{context.tenant_id}/{context.kb_id}",

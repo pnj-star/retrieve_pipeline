@@ -31,7 +31,6 @@ from .parent_docs import (
     default_token_counter,
     filter_parent_refs,
     DEFAULT_MAX_CONTEXT_TOKENS,
-    DEFAULT_MAX_DOC_TOKENS,
     validate_parent_refs,
 )
 from .results import RetrieveResult, RetrieveStatus
@@ -745,8 +744,6 @@ class RagPipeline:
         query_rewrite_mode: str | None = None,
         rewrite_query: str | None = None,
         min_relevance: float | None = None,
-        context_max_chars: int | None = None,
-        max_doc_chars: int | None = None,
         context_max_tokens: int | None = None,
         max_doc_tokens: int | None = None,
     ) -> RetrieveResult:
@@ -763,7 +760,6 @@ class RagPipeline:
                 影响底层候选集合的参数。
             output_fields: 最终父块文档的字段投影；不参与底层检索与缓存 key。
             min_relevance: 本次精排相关性阈值覆盖；None 用管线默认。
-            context_max_chars / max_doc_chars: 可选字符预算。
             context_max_tokens / max_doc_tokens: 父块上下文 token 预算。
 
         返回:
@@ -868,8 +864,6 @@ class RagPipeline:
                     parent_rows,
                     context=context,
                     count_tokens=self.count_tokens,
-                    context_max_chars=context_max_chars,
-                    max_doc_chars=max_doc_chars,
                     context_max_tokens=context_max_tokens,
                     max_doc_tokens=max_doc_tokens,
                 )
@@ -1088,8 +1082,6 @@ class RagPipeline:
             parent_rows,
             context=context,
             count_tokens=self.count_tokens,
-            context_max_chars=context_max_chars,
-            max_doc_chars=max_doc_chars,
             context_max_tokens=context_max_tokens,
             max_doc_tokens=max_doc_tokens,
         )

@@ -3,9 +3,9 @@ r"""retrieve_skill 查询改写真实链路冒烟。
 依赖（本地已具备）：Docker 内的 Milvus + Redis、缓存的
 ``BAAI/bge-small-zh-v1.5`` embedding 模型、pymilvus / sentence_transformers。
 
-用途：在真实 Milvus（稠密 + BM25 混合检索）与真实 embedding 下，验证查询改写
-开 / 关无回归，以及 ``llm_rewrite`` / ``query_expansion`` 真正进入检索并透出
-``rewritten_query``。LLM 改写文本用可控桩代替（无真实 LLM 凭据）。
+用途：在真实 Milvus（稠密 + BM25 混合检索）与真实 embedding 下，
+验证 off 基线，以及 ``llm_rewrite`` / ``query_expansion`` 真正进入检索
+并透出 ``rewritten_query``。LLM 改写文本用可控桩代替（无真实 LLM 凭据）。
 
 运行前先安装依赖（``pip install -e ../common_core`` 与
 ``pip install -e retrieve_skill``），并启动 Docker 内的 Milvus 与 Redis：
@@ -256,14 +256,6 @@ async def main() -> None:
     )
     results["off"] = {"ids": off_ids, "rewritten_query": off_trace["rewritten_query"]}
 
-    identity_ids, identity_trace = await _retrieve(
-        pipeline, query_rewrite_mode="identity"
-    )
-    results["identity"] = {
-        "ids": identity_ids,
-        "rewritten_query": identity_trace["rewritten_query"],
-    }
-
     if not USE_REAL_LLM:
         rewrite_llm.response = "七天无理由退货退款申请"
     llm_ids, llm_trace = await _retrieve(
@@ -296,9 +288,6 @@ async def main() -> None:
 
     # 断言（真实链路回归）
     assert results["off"]["ids"], "off 模式应能命中"
-    assert (
-        results["off"]["ids"] == results["identity"]["ids"]
-    ), "identity 与 off 应保持原查询，召回一致（无回归）"
     if USE_REAL_LLM:
         assert results["llm_rewrite"]["rewritten_query"], "llm_rewrite 应有改写结果"
         assert len(results["llm_rewrite"]["variants"]) >= 1
@@ -311,7 +300,7 @@ async def main() -> None:
         set(results["query_expansion"]["ids"])
     ), "query_expansion 多变体合并后不应有重复 id"
     print(
-        "\nSMOKE PASS: off/identity 无回归，改写与扩展均真实进入 Milvus 检索。"
+        "\nSMOKE PASS: 查询改写与扩展均真实进入 Milvus 检索。"
         + ("（使用真实 DeepSeek 模型改写）" if USE_REAL_LLM else "（使用可控桩）")
     )
 

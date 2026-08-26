@@ -17,7 +17,7 @@ description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent �
 
 必传参数：`query`、`tenant_id`、`kb_id`、`request_id`。
 
-可选参数：`auth_token`、`session_id`、`user_id`、`collection_name`、`top_k`、`filter_expr`、`min_relevance`、`context_max_tokens`、`max_doc_tokens`、`context_max_chars`、`max_doc_chars`。
+可选参数：`auth_token`、`session_id`、`user_id`、`collection_name`、`top_k`、`filter_expr`、`min_relevance`、`context_max_tokens`、`max_doc_tokens`。
 
 查询改写相关可选参数：
 
@@ -30,6 +30,7 @@ description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent �
   | `"query_expansion"` | 用户一句话包含多个子问题、话题宽泛或表述模糊（如"最近有什么活动优惠之类的"） | LLM 生成多条不同角度的检索变体，分别检索后合并去重，提升召回 |
 
   **注意**：`query_expansion` 会多花 LLM 调用成本和延迟，只在确实需要扩展召回时使用。
+  非法 `query_rewrite_mode` 值按 `"off"` 处理，不会回退到服务端 LLM 改写配置。
 - `rewrite_query`: 显式传入改写后的查询文本；传了即跳过改写，直接用它检索。你可以先把改写做好，再交给本工具。
 
 鉴权：启用 JWT 时，远程 HTTP 调用用 `Authorization: Bearer <jwt>` 传递令牌（也可省略并用 `auth_token` 参数传同一个 JWT）。令牌中的 `tenant_id` / `kb_id` claims 必须与调用参数一致，否则调用失败。
@@ -39,7 +40,7 @@ description: 从知识库检索可追溯文档的 RAG 检索能力。当 agent �
 ```text
 query + tenant_id + kb_id + request_id
 → 检索缓存检查（v3 完整检索签名，父块引用结果；tenant/kb 由 Redis key 外层隔离）
-   ├─ 命中 → 校验父块引用与阈值 → MySQL 回源校验 → token/字符预算重建 → status=retrieved_cache
+   ├─ 命中 → 校验父块引用与阈值 → MySQL 回源校验 → token 预算重建 → status=retrieved_cache
    └─ 未命中 → 继续
 → 查询改写（默认 off，可选 llm_rewrite / query_expansion）
    └─ 启用 → 用改写后 query / 扩展变体继续，实际检索文本见 rewritten_query
@@ -53,7 +54,7 @@ query + tenant_id + kb_id + request_id
    ├─ 没有子块过阈值 → status=no_context，docs=[]，不写缓存
    └─ 有子块过阈值 → 子块去重 → 按 parent_id 去重并构建引用
       → MySQL 批量回源父块 → 版本/状态校验 → 父块引用回写 Redis
-      → token/字符预算截断 → status=retrieved
+      → token 预算截断 → status=retrieved
 ```
 
 返回的 `rewritten_query` 是本次实际用于检索的查询文本：改写关闭（`off`）时为原始 `query`，显式传 `rewrite_query` 时为其本身。
@@ -98,7 +99,7 @@ query + tenant_id + kb_id + request_id
 | `id` | 父块主键；来自 Milvus 子块 metadata 中的 `parent_id` |
 | `child_ids` | 该父块下所有命中子块的主键列表；供核对子块级召回 |
 | `parent_id` / `parent_title` | 父块主键 / MySQL 中的标题 |
-| `content` | MySQL 权威父块正文，已做 token/字符预算截断 |
+| `content` | MySQL 权威父块正文，已做 token 预算截断 |
 | `source` / `source_type` / `category` | MySQL 中保存的来源信息 |
 | `doc_version` | 命中时 MySQL 父块的当前版本 |
 | `ce_score` | 该父块下达标子块的最高交叉编码器分数 |
@@ -127,7 +128,7 @@ query + tenant_id + kb_id + request_id
 
 - `context_max_tokens`: 所有父块正文的 token 总预算，默认 `6000`。
 - `max_doc_tokens`: 单篇父块正文 token 上限，不传时默认约为总预算一半。
-- `context_max_chars` / `max_doc_chars`: 可选字符预算；显式传入时会与 token 预算同时生效。
+
 - `filter_expr`: 附加的业务过滤表达式，会与租户 / 知识库隔离条件一起下发到向量库。
 
 ## 边界
