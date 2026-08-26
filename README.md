@@ -12,6 +12,33 @@
 - 父块引用级 Redis 缓存：缓存签名覆盖查询、改写、过滤、模型与数据版本；命中后仍回源 MySQL 重建上下文。
 - 查询改写 / 查询扩展、token 预算截断、Prometheus 指标、结构化错误契约与关键依赖故障 fail-closed。
 
+## 处理流程
+
+```mermaid
+flowchart TD
+    A["调用方 / Agent"] --> B["rag_retrieve / retrieve_context"]
+    B --> C["JWT 鉴权与租户校验"]
+    C --> D["检索缓存检查"]
+
+    D -->|"缓存命中"| E["MySQL 父块回源"]
+    D -->|"缓存未命中"| F["查询改写 / 查询扩展"]
+
+    F --> G["Milvus BM25 + Dense 混合召回"]
+    G --> H["RRF 融合"]
+    H --> I["Cross-Encoder 精排"]
+    I --> J{"是否达到相关性阈值?"}
+
+    J -->|"否"| K["返回 no_context"]
+    J -->|"是"| L["按 parent_id 聚合父块"]
+    L --> M["MySQL 批量回源父块"]
+    M --> N["校验 tenant / kb / status / doc_version"]
+    N --> O["写入 Redis 父块引用缓存"]
+    O --> P["Token 预算截断与字段投影"]
+    P --> Q["返回父块 docs"]
+
+    E --> P
+```
+
 ## 快速上手
 
 组件依赖 `common_core`，发布到私有源后可直接安装：
