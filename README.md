@@ -87,17 +87,17 @@ retrieve-skill-mcp
 
 ```bash
 # 本地构建
-docker build -t retrieve-skill:0.1.0 .
+docker build -t retrieve-skill:0.1.1 .
 
 # 用 .env 提供 Milvus / MySQL / Redis / LLM 等配置
-docker run --rm -p 8000:8000 --env-file .env retrieve-skill:0.1.0
+docker run --rm -p 8000:8000 --env-file .env retrieve-skill:0.1.1
 ```
 
-推送 tag `v0.1.0` 后可从 GHCR 直接拉取：
+推送 tag `v0.1.1` 后可从 GHCR 直接拉取：
 
 ```bash
-docker pull ghcr.io/<owner>/retrieve_pipeline:v0.1.0
-docker run --rm -p 8000:8000 --env-file .env ghcr.io/<owner>/retrieve_pipeline:v0.1.0
+docker pull ghcr.io/<owner>/retrieve_pipeline:v0.1.1
+docker run --rm -p 8000:8000 --env-file .env ghcr.io/<owner>/retrieve_pipeline:v0.1.1
 ```
 
 注意：

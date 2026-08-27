@@ -1,10 +1,10 @@
 [project]
 name = "retrieve-skill"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reusable retrieval pipeline skill built on common_core providers."
 requires-python = ">=3.11"
 dependencies = [
-  "common-core[llm,vector,cache]>=0.1.0,<0.2",
+  "common-core[llm,vector,cache,embedding]>=0.1.1,<0.2",
   "tiktoken>=0.8",
 ]
 
